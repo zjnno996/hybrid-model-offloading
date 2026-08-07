@@ -14,6 +14,15 @@ deliberately tensor-agnostic so it can be used by vLLM's existing Mamba state
 manager and future linear-attention managers without copying model-specific
 state layouts.
 
+## Experimental vLLM integration
+
+Set `VLLM_PREFIX_CACHE_RETENTION_INTERVAL` to a positive multiple of the
+scheduler block size for a Mamba/linear model with prefix caching enabled.
+`MambaManager` then stores state blocks at each interval boundary and at the
+latest complete prompt boundary; an incoming hit resumes from the deepest
+available state and replays the suffix. The default (`unset`) remains dense
+prefix caching.
+
 Validation:
 
 ```text

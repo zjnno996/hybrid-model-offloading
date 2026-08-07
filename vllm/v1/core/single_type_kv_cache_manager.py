@@ -1208,6 +1208,49 @@ class MambaManager(SingleTypeKVCacheManager):
         """
         return num_computed_tokens - 1
 
+    @classmethod
+    def reachable_block_mask(
+        cls,
+        start_block: int,
+        end_block: int,
+        alignment_tokens: int | None,
+        kv_cache_spec: KVCacheSpec,
+        use_eagle: bool,
+        retention_interval: int | None = None,
+        num_prompt_tokens: int | None = None,
+    ) -> list[bool] | None:
+        """Keep sparse exact recurrent-state checkpoints.
+
+        A Mamba/linear cache block holds the state after its final token, so
+        retaining the block at each segment boundary is sufficient to resume
+        from that boundary and replay only the suffix. ``find_longest_cache_hit``
+        already searches these non-contiguous checkpoints from right to left.
+        """
+        del alignment_tokens, use_eagle
+        assert isinstance(kv_cache_spec, MambaSpec)
+        if retention_interval is None:
+            return None
+        if retention_interval == 0:
+            return [False] * (end_block - start_block)
+
+        block_size = kv_cache_spec.block_size
+        mask = [False] * (end_block - start_block)
+        for block_idx in range(start_block, end_block):
+            end_tokens = (block_idx + 1) * block_size
+            if end_tokens % retention_interval == 0:
+                mask[block_idx - start_block] = True
+
+        # Preserve the latest full prompt boundary as a replay fallback. This
+        # lets an exact prompt hit avoid falling all the way back to the prior
+        # coarse segment when the prompt ends between checkpoint intervals.
+        if num_prompt_tokens is not None:
+            latest_full_end = (num_prompt_tokens // block_size) * block_size
+            if latest_full_end:
+                latest_idx = latest_full_end // block_size - 1
+                if start_block <= latest_idx < end_block:
+                    mask[latest_idx - start_block] = True
+        return mask
+
     def cache_blocks(
         self,
         request: Request,

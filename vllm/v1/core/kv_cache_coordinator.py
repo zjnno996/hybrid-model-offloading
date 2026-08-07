@@ -22,6 +22,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    MambaSpec,
     SlidingWindowSpec,
 )
 from vllm.v1.request import Request
@@ -35,18 +36,17 @@ def _validate_prefix_cache_retention_interval(
     if retention_interval is None:
         return
 
-    # Retention only sparsifies sliding-window checkpoints for now; every other
-    # manager (full attention, Mamba, chunked-local) caches densely and
-    # ignores it to be conservative.
-    # TODO: Support Mamba/linear attention.
+    # Sliding-window attention retains a short tail per segment. Mamba/linear
+    # attention can retain one exact recurrent-state checkpoint per segment;
+    # its manager resolves a prefix hit from the latest retained checkpoint.
     if not any(
-        isinstance(g.kv_cache_spec, SlidingWindowSpec)
+        isinstance(g.kv_cache_spec, (SlidingWindowSpec, MambaSpec))
         for g in kv_cache_config.kv_cache_groups
     ):
         raise ValueError(
             "VLLM_PREFIX_CACHE_RETENTION_INTERVAL is set but this model has "
-            "no sliding-window KV cache group, so retention has no effect. "
-            "Unset it (the feature only applies to sliding-window attention)."
+            "no sliding-window or Mamba/linear cache group, so retention has "
+            "no effect. Unset it for full-attention-only models."
         )
 
     if retention_interval < 0 or retention_interval % scheduler_block_size != 0:
