@@ -56,3 +56,18 @@ def test_kvbuffer_bank_commits_or_rolls_back_per_state_slot():
     assert bank.get(7).keys.shape[0] == 2
     bank.release((7,))
     assert bank.get(7).keys.shape[0] == 0
+
+
+def test_kvbuffer_slot_export_and_restore_preserves_unflushed_tail():
+    source = KVBufferBank(2, 1, KVBufferConfig(buffer_tokens=4))
+    source.get(7).append(
+        torch.tensor([[1.0, 2.0], [3.0, 4.0]]), torch.tensor([[5.0], [6.0]])
+    )
+    expected = source.get(7).materialize(torch.tensor([[1.0, 1.0]]))
+
+    target = KVBufferBank(2, 1, KVBufferConfig(buffer_tokens=4))
+    target.restore_slots(source.export_slots((7,)))
+    assert torch.allclose(
+        target.get(7).materialize(torch.tensor([[1.0, 1.0]])), expected
+    )
+    assert torch.equal(target.get(7).keys, source.get(7).keys)

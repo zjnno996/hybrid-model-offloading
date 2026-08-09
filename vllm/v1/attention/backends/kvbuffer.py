@@ -83,6 +83,32 @@ class KVBuffer:
         self.keys = snapshot.keys.clone()
         self.values = snapshot.values.clone()
 
+    def export_state(self, *, device: torch.device | str = "cpu") -> KVBufferSnapshot:
+        """Return an exact, transportable state including the unflushed tail.
+
+        Keeping the tail is essential: flushing it merely to offload would
+        defeat KVBuffer's I/O-saving policy and can change the update cadence
+        of an attention kernel that consumes the state incrementally.
+        """
+        target = torch.device(device)
+        return KVBufferSnapshot(
+            self.state_kv.to(target).clone(),
+            self.state_z.to(target).clone(),
+            self.keys.to(target).clone(),
+            self.values.to(target).clone(),
+        )
+
+    def restore_state(self, snapshot: KVBufferSnapshot) -> None:
+        """Restore a state previously produced by :meth:`export_state`."""
+        if snapshot.state_kv.shape != self.state_kv.shape:
+            raise ValueError("state_kv shape does not match the buffer")
+        if snapshot.state_z.shape != self.state_z.shape:
+            raise ValueError("state_z shape does not match the buffer")
+        self.state_kv.copy_(snapshot.state_kv.to(self.state_kv))
+        self.state_z.copy_(snapshot.state_z.to(self.state_z))
+        self.keys = snapshot.keys.to(self.state_kv).clone()
+        self.values = snapshot.values.to(self.state_kv).clone()
+
     def _flush_old_chunks(self) -> None:
         while self.keys.shape[0] > self.config.buffer_tokens:
             overflow = self.keys.shape[0] - self.config.buffer_tokens
@@ -158,3 +184,17 @@ class KVBufferBank:
         for state_id in state_ids:
             self._buffers.pop(state_id, None)
             self._speculative.pop(state_id, None)
+
+    def export_slots(
+        self, state_ids: Sequence[Hashable], *, device: torch.device | str = "cpu"
+    ) -> dict[Hashable, KVBufferSnapshot]:
+        """Export selected vLLM state slots for an offload connector."""
+        return {
+            state_id: self.get(state_id).export_state(device=device)
+            for state_id in state_ids
+        }
+
+    def restore_slots(self, snapshots: dict[Hashable, KVBufferSnapshot]) -> None:
+        """Restore slots fetched by an offload connector before compute."""
+        for state_id, snapshot in snapshots.items():
+            self.get(state_id).restore_state(snapshot)
