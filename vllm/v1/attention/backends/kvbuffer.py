@@ -136,6 +136,140 @@ class KVBuffer:
         self.state_z.add_(keys.sum(dim=0))
 
 
+@dataclass
+class DecayedKVBufferSnapshot:
+    state_kv: torch.Tensor
+    keys: torch.Tensor
+    values: torch.Tensor
+
+
+class DecayedKVBuffer:
+    """Recent-token buffer for the MiniMax/Bailing linear recurrence.
+
+    These models update each head as ``S_t = exp(-slope) * S_{t-1} +
+    outer(k_t, v_t)``.  The committed state is kept in the caller-provided
+    tensor (normally a vLLM Mamba cache slot); only the recent tail is owned by
+    this object.  Thus enabling KVBuffer does not allocate a second full state
+    per request.
+    """
+
+    def __init__(
+        self,
+        state_kv: torch.Tensor,
+        slope_rate: torch.Tensor,
+        config: KVBufferConfig | None = None,
+    ) -> None:
+        if state_kv.ndim != 3 or state_kv.shape[1] != state_kv.shape[2]:
+            raise ValueError("state_kv must have shape [heads, dim, dim]")
+        slopes = slope_rate.reshape(-1).to(device=state_kv.device, dtype=torch.float32)
+        if slopes.numel() != state_kv.shape[0]:
+            raise ValueError("slope_rate must have one value per head")
+        self.state_kv = state_kv
+        self.slope_rate = slopes
+        self.ratios = torch.exp(-slopes).to(dtype=state_kv.dtype)
+        self.config = config or KVBufferConfig()
+        if self.config.buffer_tokens <= 0 or self.config.update_chunk_tokens <= 0:
+            raise ValueError("buffer_tokens and update_chunk_tokens must be positive")
+        self.keys = torch.empty(
+            (0, state_kv.shape[0], state_kv.shape[1]),
+            device=state_kv.device,
+            dtype=state_kv.dtype,
+        )
+        self.values = torch.empty_like(self.keys)
+
+    def reset(self) -> None:
+        self.state_kv.zero_()
+        self.keys = self.keys[:0]
+        self.values = self.values[:0]
+
+    def append(
+        self, queries: torch.Tensor, keys: torch.Tensor, values: torch.Tensor
+    ) -> torch.Tensor:
+        """Update the recurrence and return one output per input token."""
+        if (
+            queries.ndim != 3
+            or keys.shape != queries.shape
+            or values.shape != queries.shape
+        ):
+            raise ValueError("queries, keys, and values must all be [tokens, heads, dim]")
+        outputs: list[torch.Tensor] = []
+        for token_idx in range(queries.shape[0]):
+            self.keys = torch.cat((self.keys, keys[token_idx : token_idx + 1]), dim=0)
+            self.values = torch.cat((self.values, values[token_idx : token_idx + 1]), dim=0)
+            self._flush_old_chunks()
+            outputs.append(torch.einsum("hd,hde->he", queries[token_idx], self.materialize()))
+        return torch.stack(outputs, dim=0) if outputs else queries.new_empty(queries.shape)
+
+    def materialize(self) -> torch.Tensor:
+        """Return the state after the committed state and buffered tail."""
+        count = self.keys.shape[0]
+        if count == 0:
+            return self.state_kv
+        powers = self.ratios.unsqueeze(0).pow(
+            torch.arange(
+                count - 1, -1, -1, device=self.state_kv.device, dtype=torch.float32
+            ).unsqueeze(1)
+        )
+        state = self.state_kv * self.ratios.pow(count).view(-1, 1, 1)
+        state = state + torch.einsum("thd,the,th->hde", self.keys, self.values, powers)
+        return state
+
+    def flush(self) -> None:
+        if self.keys.shape[0]:
+            self.state_kv.copy_(self.materialize())
+            self.keys = self.keys[:0]
+            self.values = self.values[:0]
+
+    def snapshot(self) -> DecayedKVBufferSnapshot:
+        return DecayedKVBufferSnapshot(
+            self.state_kv.clone(), self.keys.clone(), self.values.clone()
+        )
+
+    def rollback(self, snapshot: DecayedKVBufferSnapshot) -> None:
+        self.state_kv.copy_(snapshot.state_kv.to(self.state_kv))
+        self.keys = snapshot.keys.to(self.state_kv).clone()
+        self.values = snapshot.values.to(self.state_kv).clone()
+
+    def export_state(
+        self, *, device: torch.device | str = "cpu"
+    ) -> DecayedKVBufferSnapshot:
+        target = torch.device(device)
+        return DecayedKVBufferSnapshot(
+            self.state_kv.to(target).clone(),
+            self.keys.to(target).clone(),
+            self.values.to(target).clone(),
+        )
+
+    def restore_state(self, snapshot: DecayedKVBufferSnapshot) -> None:
+        if snapshot.state_kv.shape != self.state_kv.shape:
+            raise ValueError("state_kv shape does not match the buffer")
+        self.state_kv.copy_(snapshot.state_kv.to(self.state_kv))
+        self.keys = snapshot.keys.to(self.state_kv).clone()
+        self.values = snapshot.values.to(self.state_kv).clone()
+
+    def _flush_old_chunks(self) -> None:
+        while self.keys.shape[0] > self.config.buffer_tokens:
+            overflow = self.keys.shape[0] - self.config.buffer_tokens
+            commit_tokens = min(overflow, self.config.update_chunk_tokens)
+            commit_keys = self.keys[:commit_tokens]
+            commit_values = self.values[:commit_tokens]
+            weights = self.ratios.unsqueeze(0).pow(
+                torch.arange(
+                    commit_tokens - 1,
+                    -1,
+                    -1,
+                    device=self.state_kv.device,
+                    dtype=torch.float32,
+                ).unsqueeze(1)
+            )
+            self.state_kv.mul_(self.ratios.pow(commit_tokens).view(-1, 1, 1))
+            self.state_kv.add_(
+                torch.einsum("thd,the,th->hde", commit_keys, commit_values, weights)
+            )
+            self.keys = self.keys[commit_tokens:]
+            self.values = self.values[commit_tokens:]
+
+
 class KVBufferBank:
     """Own KVBuffer instances by vLLM linear-state slot ID.
 

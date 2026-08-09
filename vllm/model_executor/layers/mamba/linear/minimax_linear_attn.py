@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 
+import vllm.envs as envs
 from vllm.config import get_current_vllm_config
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.model_executor.custom_op import PluggableLayer
@@ -17,6 +18,10 @@ from vllm.model_executor.layers.lightning_attn import (
 )
 from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.mamba.linear.base import LinearAttention
+from vllm.v1.attention.backends.kvbuffer import (
+    DecayedKVBuffer,
+    KVBufferConfig,
+)
 from vllm.model_executor.layers.minimax_rms_norm import MiniMaxText01RMSNormTP
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionMetadata
@@ -197,6 +202,12 @@ class MiniMaxText01LinearAttention(LinearAttention):
         self.tp_slope = self.slope_rate[
             self.tp_rank * self.tp_heads : (self.tp_rank + 1) * self.tp_heads
         ].contiguous()
+        self._kvbuffer_enabled = envs.VLLM_KVBUFFER_ENABLED
+        self._kvbuffer_config = KVBufferConfig(
+            buffer_tokens=envs.VLLM_KVBUFFER_BUFFER_TOKENS,
+            update_chunk_tokens=envs.VLLM_KVBUFFER_UPDATE_CHUNK_TOKENS,
+        )
+        self._kvbuffer_slots: dict[int, DecayedKVBuffer] = {}
 
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -247,6 +258,83 @@ class MiniMaxText01LinearAttention(LinearAttention):
             prefix_fn=MiniMaxText01LinearKernel.jit_linear_forward_prefix,
             layer_idx=self.layer_idx,
         )
+
+    def _get_kvbuffer(self, slot_id: torch.Tensor, kv_cache: torch.Tensor) -> DecayedKVBuffer:
+        slot = int(slot_id.item())
+        state = kv_cache[slot]
+        buffer = self._kvbuffer_slots.get(slot)
+        if buffer is None or buffer.state_kv.data_ptr() != state.data_ptr():
+            buffer = DecayedKVBuffer(state, self.tp_slope, self._kvbuffer_config)
+            self._kvbuffer_slots[slot] = buffer
+        return buffer
+
+    def _reset_kvbuffer_new_sequences(
+        self,
+        kv_cache: torch.Tensor,
+        state_indices_tensor: torch.Tensor,
+        attn_metadata: LinearAttentionMetadata,
+    ) -> None:
+        offset = attn_metadata.num_decode_tokens
+        for prefill_idx in range(attn_metadata.num_prefills):
+            q_start = attn_metadata.query_start_loc[offset + prefill_idx]
+            q_end = attn_metadata.query_start_loc[offset + prefill_idx + 1]
+            query_len = q_end - q_start
+            context_len = (
+                attn_metadata.seq_lens[offset + prefill_idx] - query_len
+            )
+            if context_len == 0:
+                slot_id = state_indices_tensor[offset + prefill_idx]
+                self._get_kvbuffer(slot_id, kv_cache).reset()
+
+    def _kvbuffer_prefill_and_mix_infer(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        kv_cache: torch.Tensor,
+        state_indices_tensor: torch.Tensor,
+        attn_metadata: LinearAttentionMetadata,
+    ) -> torch.Tensor:
+        hidden: list[torch.Tensor] = []
+        offset = attn_metadata.num_decode_tokens
+        for prefill_idx in range(attn_metadata.num_prefills):
+            start = attn_metadata.query_start_loc[offset + prefill_idx]
+            end = attn_metadata.query_start_loc[offset + prefill_idx + 1]
+            slot_id = state_indices_tensor[offset + prefill_idx]
+            buffer = self._get_kvbuffer(slot_id, kv_cache)
+            output = buffer.append(q[start:end], k[start:end], v[start:end])
+            hidden.append(output.reshape(output.shape[0], -1).contiguous())
+
+        if attn_metadata.num_decode_tokens > 0:
+            hidden.insert(
+                0,
+                self._kvbuffer_decode_infer(
+                    q, k, v, kv_cache, state_indices_tensor, attn_metadata
+                ),
+            )
+        if not hidden:
+            return torch.empty((0, q.shape[1] * q.shape[2]), device=q.device, dtype=q.dtype)
+        return torch.cat(hidden, dim=0).contiguous()
+
+    def _kvbuffer_decode_infer(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        kv_cache: torch.Tensor,
+        state_indices_tensor: torch.Tensor,
+        attn_metadata: LinearAttentionMetadata,
+    ) -> torch.Tensor:
+        outputs: list[torch.Tensor] = []
+        for idx in range(attn_metadata.num_decode_tokens):
+            slot_id = state_indices_tensor[idx]
+            output = self._get_kvbuffer(slot_id, kv_cache).append(
+                q[idx : idx + 1], k[idx : idx + 1], v[idx : idx + 1]
+            )
+            outputs.append(output.reshape(1, -1))
+        if not outputs:
+            return torch.empty((0, q.shape[1] * q.shape[2]), device=q.device, dtype=q.dtype)
+        return torch.cat(outputs, dim=0).contiguous()
 
     def _decode_infer(self, q, k, v, kv_cache, state_indices_tensor, attn_metadata):
         hidden = linear_attention_decode(
@@ -301,6 +389,10 @@ class MiniMaxText01LinearAttention(LinearAttention):
             clear_linear_attention_cache_for_new_sequences(
                 kv_cache, state_indices_tensor, attn_metadata
             )
+            if self._kvbuffer_enabled:
+                self._reset_kvbuffer_new_sequences(
+                    kv_cache, state_indices_tensor, attn_metadata
+                )
 
         decode_only = getattr(attn_metadata, "num_prefills", 0) == 0
         if attn_metadata is None:
@@ -309,13 +401,23 @@ class MiniMaxText01LinearAttention(LinearAttention):
             )
         else:
             if not decode_only:
-                hidden = self._prefill_and_mix_infer(
-                    q, k, v, kv_cache, state_indices_tensor, attn_metadata
-                )
+                if self._kvbuffer_enabled:
+                    hidden = self._kvbuffer_prefill_and_mix_infer(
+                        q, k, v, kv_cache, state_indices_tensor, attn_metadata
+                    )
+                else:
+                    hidden = self._prefill_and_mix_infer(
+                        q, k, v, kv_cache, state_indices_tensor, attn_metadata
+                    )
             else:
-                hidden = self._decode_infer(
-                    q, k, v, kv_cache, state_indices_tensor, attn_metadata
-                )
+                if self._kvbuffer_enabled:
+                    hidden = self._kvbuffer_decode_infer(
+                        q, k, v, kv_cache, state_indices_tensor, attn_metadata
+                    )
+                else:
+                    hidden = self._decode_infer(
+                        q, k, v, kv_cache, state_indices_tensor, attn_metadata
+                    )
         hidden = self.norm._forward(hidden)
         gate, _ = self.output_gate(hidden_states[:num_actual_tokens])
         hidden = F.sigmoid(gate) * hidden

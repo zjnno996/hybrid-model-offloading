@@ -3,6 +3,7 @@
 import torch
 
 from vllm.v1.attention.backends.kvbuffer import (
+    DecayedKVBuffer,
     KVBuffer,
     KVBufferBank,
     KVBufferConfig,
@@ -76,3 +77,39 @@ def test_kvbuffer_slot_export_and_restore_preserves_unflushed_tail():
 def test_kvbuffer_environment_factory_is_disabled_by_default():
     bank = KVBufferBank.from_environment(2, 1)
     assert bank.config.enabled is False
+
+
+def test_decayed_kvbuffer_matches_linear_attention_recurrence():
+    torch.manual_seed(0)
+    heads, dim, tokens = 2, 3, 7
+    queries = torch.randn(tokens, heads, dim)
+    keys = torch.randn(tokens, heads, dim)
+    values = torch.randn(tokens, heads, dim)
+    slopes = torch.tensor([0.1, 0.25])
+    state = torch.zeros(heads, dim, dim)
+    buffer = DecayedKVBuffer(
+        state, slopes, KVBufferConfig(buffer_tokens=2, update_chunk_tokens=1)
+    )
+
+    expected_state = state.clone()
+    expected_outputs = []
+    ratios = torch.exp(-slopes).view(heads, 1, 1)
+    for q, k, v in zip(queries, keys, values):
+        expected_state = ratios * expected_state + torch.einsum("hd,he->hde", k, v)
+        expected_outputs.append(torch.einsum("hd,hde->he", q, expected_state))
+
+    actual_outputs = buffer.append(queries, keys, values)
+    assert torch.allclose(actual_outputs, torch.stack(expected_outputs), atol=1e-5)
+    assert torch.allclose(buffer.materialize(), expected_state, atol=1e-5)
+
+
+def test_decayed_kvbuffer_export_restore_preserves_tail():
+    state = torch.zeros(1, 2, 2)
+    source = DecayedKVBuffer(state, torch.tensor([0.2]), KVBufferConfig(buffer_tokens=4))
+    qkv = torch.ones(3, 1, 2)
+    source.append(qkv, qkv, qkv)
+    snapshot = source.export_state()
+    target = DecayedKVBuffer(torch.zeros_like(state), torch.tensor([0.2]))
+    target.restore_state(snapshot)
+    assert torch.allclose(target.materialize(), source.materialize())
+    assert torch.equal(target.keys, source.keys)
