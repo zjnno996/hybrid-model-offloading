@@ -21,4 +21,9 @@ same timestamp. This makes the overlap and critical path testable without
 requiring a particular DMA backend; a CPU offload worker can map these three
 stages to its existing streams.
 
+`KVPRExecutor` now implements this dependency protocol with backend callbacks.
+It is suitable for a connector that can provide activation DMA and prefix
+prefill callbacks; it does not silently alter vLLM's current all-or-nothing
+offloaded-prefix scheduling.
+
 Benchmark: `python benchmarks/reproductions/kvpr_acl25.py`.

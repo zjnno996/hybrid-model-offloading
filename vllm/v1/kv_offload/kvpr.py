@@ -10,7 +10,10 @@ This keeps the policy testable without requiring a particular DMA backend.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -56,6 +59,53 @@ class KVPRPlan:
             ("prefix_recompute", activation, activation + recompute),
             ("suffix_transfer", activation, activation + suffix),
         )
+
+
+@dataclass(frozen=True)
+class KVPRExecutionCallbacks:
+    """Backend hooks for the three KVPR execution stages.
+
+    The callbacks can submit CUDA-stream work, issue DMA, or block until their
+    respective operation completes. They receive a token count, which keeps
+    this protocol independent of a specific activation/KV tensor layout.
+    """
+
+    load_activations: Callable[[int], Any]
+    recompute_prefix: Callable[[int], Any]
+    load_kv_suffix: Callable[[int], Any]
+
+
+@dataclass(frozen=True)
+class KVPRExecutionResult:
+    activation_result: Any
+    recompute_result: Any | None
+    suffix_result: Any | None
+
+
+class KVPRExecutor:
+    """Run a plan with the paper's activation-then-overlap dependency."""
+
+    @staticmethod
+    def execute(
+        plan: KVPRPlan, callbacks: KVPRExecutionCallbacks
+    ) -> KVPRExecutionResult:
+        activation_result = callbacks.load_activations(plan.recompute_tokens)
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="kvpr") as executor:
+            recompute = (
+                executor.submit(callbacks.recompute_prefix, plan.recompute_tokens)
+                if plan.recompute_tokens
+                else None
+            )
+            suffix = (
+                executor.submit(callbacks.load_kv_suffix, plan.transfer_tokens)
+                if plan.transfer_tokens
+                else None
+            )
+            return KVPRExecutionResult(
+                activation_result=activation_result,
+                recompute_result=None if recompute is None else recompute.result(),
+                suffix_result=None if suffix is None else suffix.result(),
+            )
 
 
 class KVPRPlanner:
