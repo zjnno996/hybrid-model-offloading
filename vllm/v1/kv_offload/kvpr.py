@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 
@@ -36,10 +36,31 @@ class KVPRPlan:
     estimated_seconds: float
     activation_bytes: int
     kv_bytes: int
+    # ``overlap`` is the analytical KVPR timeline.  The vLLM scheduler uses
+    # ``contiguous_prefix_load``: it loads the first ``transfer_tokens`` from
+    # the remote cache and lets the normal forward path recompute the suffix.
+    # Keeping this explicit prevents a model runner from mistaking the
+    # scheduler-safe plan for an activation-DMA plan.
+    execution_mode: str = "overlap"
 
     @property
     def is_partial(self) -> bool:
         return 0 < self.recompute_tokens < self.total_tokens
+
+    @property
+    def loads_contiguous_prefix(self) -> bool:
+        return self.execution_mode == "contiguous_prefix_load"
+
+    def as_contiguous_prefix_load(self) -> "KVPRPlan":
+        """Adapt the analytical split to vLLM's contiguous KV API.
+
+        vLLM's scheduler exposes a single prefix length as externally
+        computed.  This mode therefore treats ``transfer_tokens`` as the
+        loaded prefix and leaves the remaining suffix for the ordinary model
+        forward, which is an executable partial-recompute path for all models
+        supported by the offloading connector.
+        """
+        return replace(self, execution_mode="contiguous_prefix_load")
 
     def timeline(self, planner: "KVPRPlanner", batch_size: int, hidden_size: int):
         """Return the overlapped transfer/recompute stages.
@@ -48,7 +69,25 @@ class KVPRPlan:
         GPU recomputation and suffix KV DMA start together, which is the
         critical path used by KVPR's analytical model.
         """
-        activation = self.activation_bytes / planner.config.cpu_gpu_bandwidth_bytes_per_second
+        if self.loads_contiguous_prefix:
+            prefix_transfer = self.kv_bytes / (
+                planner.config.cpu_gpu_bandwidth_bytes_per_second
+            )
+            recompute = (
+                4 * batch_size * self.recompute_tokens * hidden_size * hidden_size
+            ) / planner.config.gpu_compute_flops_per_second
+            return (
+                ("prefix_kv_transfer", 0.0, prefix_transfer),
+                (
+                    "suffix_recompute",
+                    prefix_transfer,
+                    prefix_transfer + recompute,
+                ),
+            )
+
+        activation = self.activation_bytes / (
+            planner.config.cpu_gpu_bandwidth_bytes_per_second
+        )
         suffix_bytes = self.kv_bytes
         suffix = suffix_bytes / planner.config.cpu_gpu_bandwidth_bytes_per_second
         recompute = (
@@ -121,7 +160,11 @@ class KVPRPlanner:
             raise ValueError("GPU compute throughput must be positive")
 
     def estimate_seconds(
-        self, total_tokens: int, recompute_tokens: int, batch_size: int, hidden_size: int
+        self,
+        total_tokens: int,
+        recompute_tokens: int,
+        batch_size: int,
+        hidden_size: int,
     ) -> float:
         """Estimate the overlapped load/recompute time for a split."""
         self._validate(total_tokens, recompute_tokens, batch_size, hidden_size)
@@ -135,12 +178,37 @@ class KVPRPlanner:
             * hidden_size
             * dtype_bytes
         )
-        transfer_prefix = activation_bytes / self.config.cpu_gpu_bandwidth_bytes_per_second
+        transfer_prefix = activation_bytes / (
+            self.config.cpu_gpu_bandwidth_bytes_per_second
+        )
         transfer_suffix = kv_bytes / self.config.cpu_gpu_bandwidth_bytes_per_second
         recompute = (
             4 * batch_size * recompute_tokens * hidden_size * hidden_size
         ) / self.config.gpu_compute_flops_per_second
         return transfer_prefix + max(recompute, transfer_suffix)
+
+    def estimate_contiguous_prefix_seconds(
+        self,
+        total_tokens: int,
+        recompute_tokens: int,
+        batch_size: int,
+        hidden_size: int,
+    ) -> float:
+        """Estimate the scheduler-safe prefix-load/suffix-recompute path."""
+        self._validate(total_tokens, recompute_tokens, batch_size, hidden_size)
+        transfer_tokens = total_tokens - recompute_tokens
+        kv_bytes = (
+            2
+            * batch_size
+            * transfer_tokens
+            * hidden_size
+            * self.config.dtype_bytes
+        )
+        transfer = kv_bytes / self.config.cpu_gpu_bandwidth_bytes_per_second
+        recompute = (
+            4 * batch_size * recompute_tokens * hidden_size * hidden_size
+        ) / self.config.gpu_compute_flops_per_second
+        return transfer + recompute
 
     def plan(
         self,
@@ -165,7 +233,12 @@ class KVPRPlanner:
         estimated_seconds = self.estimate_seconds(
             total_tokens, recompute_tokens, batch_size, hidden_size
         )
-        activation_bytes = batch_size * recompute_tokens * hidden_size * self.config.dtype_bytes
+        activation_bytes = (
+            batch_size
+            * recompute_tokens
+            * hidden_size
+            * self.config.dtype_bytes
+        )
         kv_bytes = (
             2
             * batch_size
@@ -181,6 +254,25 @@ class KVPRPlanner:
             activation_bytes=activation_bytes,
             kv_bytes=kv_bytes,
         )
+
+    def plan_for_remote_hit(
+        self, hit_tokens: int, batch_size: int, hidden_size: int
+    ) -> KVPRPlan:
+        """Plan a scheduler-safe split for an already-hit remote prefix.
+
+        The regular analytical planner accepts prompt plus generation tokens.
+        A remote lookup, however, only proves a contiguous prefix hit.  Keep
+        the plan bounded by that hit and mark it as a contiguous-prefix load
+        so callers can use ``transfer_tokens`` as the external-computed count.
+        """
+        if hit_tokens < 0:
+            raise ValueError("hit_tokens must be non-negative")
+        return self.plan(
+            prompt_tokens=hit_tokens,
+            generation_tokens=0,
+            batch_size=batch_size,
+            hidden_size=hidden_size,
+        ).as_contiguous_prefix_load()
 
     @staticmethod
     def _validate(

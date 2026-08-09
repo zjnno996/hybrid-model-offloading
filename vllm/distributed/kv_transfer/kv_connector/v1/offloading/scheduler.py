@@ -189,8 +189,9 @@ class RequestOffloadState:
     # this contains either a single load job, or one or more store jobs.
     transfer_jobs: set[int] = field(default_factory=set)
     # Set only when the experimental KVPR switch is enabled and a remote
-    # prefix hit is found.  The scheduler still uses the existing contiguous
-    # load protocol unless a model runner explicitly consumes this plan.
+    # prefix hit is found.  In contiguous-prefix mode the plan is also used
+    # to reduce the externally-computed prefix, so the remaining suffix is
+    # actually recomputed by the normal model forward.
     kvpr_plan: KVPRPlan | None = None
 
     def __post_init__(self) -> None:
@@ -588,6 +589,48 @@ class OffloadingConnectorScheduler:
             req_status.kvpr_plan = self._make_kvpr_plan(
                 request, num_hit_tokens, self._kvpr_hidden_size
             )
+            if req_status.kvpr_plan is not None:
+                # ``num_hit_tokens`` is block-aligned.  Preserve that
+                # invariant when handing a shorter prefix to the scheduler;
+                # otherwise the connector would load a full block while the
+                # request state claimed a partial block was computed.
+                alignment = max(
+                    group.offloaded_block_size
+                    for group in self.config.kv_group_configs
+                )
+                recompute_tokens = (
+                    req_status.kvpr_plan.recompute_tokens // alignment * alignment
+                )
+                transfer_tokens = num_hit_tokens - recompute_tokens
+                req_status.kvpr_plan = KVPRPlan(
+                    total_tokens=num_hit_tokens,
+                    recompute_tokens=recompute_tokens,
+                    transfer_tokens=transfer_tokens,
+                    estimated_seconds=(
+                        self._kvpr_planner.estimate_contiguous_prefix_seconds(
+                            num_hit_tokens,
+                            recompute_tokens,
+                            batch_size=1,
+                            hidden_size=self._kvpr_hidden_size,
+                        )
+                    ),
+                    activation_bytes=(
+                        recompute_tokens
+                        * self._kvpr_hidden_size
+                        * self._kvpr_planner.config.dtype_bytes
+                    ),
+                    kv_bytes=(
+                        2
+                        * transfer_tokens
+                        * self._kvpr_hidden_size
+                        * self._kvpr_planner.config.dtype_bytes
+                    ),
+                    execution_mode="contiguous_prefix_load",
+                )
+                # Returning this shorter prefix is the actual execution
+                # switch.  The scheduler waits for its KV load, then resumes
+                # the request at the suffix and computes those tokens on GPU.
+                num_hit_tokens = transfer_tokens
         req_status.update_num_hit_blocks(num_computed_tokens + (num_hit_tokens or 0))
 
         self._touch(req_status)
@@ -596,27 +639,19 @@ class OffloadingConnectorScheduler:
 
     def _make_kvpr_plan(
         self, request: Request, num_hit_tokens: int, hidden_size: int
-    ) -> KVPRPlan:
+    ) -> KVPRPlan | None:
         assert self._kvpr_planner is not None
-        prompt_tokens = max(0, request.num_prompt_tokens)
-        generation_tokens = max(0, request.num_tokens - prompt_tokens)
-        plan = self._kvpr_planner.plan(
-            prompt_tokens=prompt_tokens,
-            generation_tokens=generation_tokens,
+        # Only apply the contiguous-prefix execution path while the request
+        # is still a prompt prefill.  Applying it during decode could turn a
+        # one-token KV hit into a non-contiguous state transition.
+        if request.num_tokens > request.num_prompt_tokens:
+            return None
+        if num_hit_tokens <= 0:
+            return None
+        return self._kvpr_planner.plan_for_remote_hit(
+            hit_tokens=min(num_hit_tokens, request.num_prompt_tokens),
             batch_size=1,
             hidden_size=hidden_size,
-        )
-        # The existing connector reports only a block-aligned hit.  Clamp the
-        # advisory plan to the actually available hit; this prevents metadata
-        # from claiming a suffix that the backend did not find.
-        recompute_tokens = min(plan.recompute_tokens, num_hit_tokens)
-        return KVPRPlan(
-            total_tokens=plan.total_tokens,
-            recompute_tokens=recompute_tokens,
-            transfer_tokens=plan.total_tokens - recompute_tokens,
-            estimated_seconds=plan.estimated_seconds,
-            activation_bytes=plan.activation_bytes,
-            kv_bytes=plan.kv_bytes,
         )
 
     def update_state_after_alloc(

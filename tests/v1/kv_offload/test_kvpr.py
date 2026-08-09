@@ -130,3 +130,29 @@ def test_kvpr_metadata_is_exposed_to_forward_context(monkeypatch):
     )
     KVConnectorModelRunnerMixin._bind_experimental_forward_metadata(metadata)
     assert context.additional_kwargs["kvpr_plans"]["request-1"] is plan
+
+
+def test_kvpr_remote_hit_plan_is_scheduler_safe():
+    planner = KVPRPlanner(
+        KVPRConfig(
+            cpu_gpu_bandwidth_bytes_per_second=32e9,
+            gpu_compute_flops_per_second=312e12,
+            token_step=4,
+        )
+    )
+    plan = planner.plan_for_remote_hit(hit_tokens=32, batch_size=1, hidden_size=768)
+    assert plan.loads_contiguous_prefix
+    assert plan.transfer_tokens + plan.recompute_tokens == 32
+    assert plan.transfer_tokens % 4 == 0
+    stages = plan.timeline(planner, batch_size=1, hidden_size=768)
+    assert [stage[0] for stage in stages] == [
+        "prefix_kv_transfer",
+        "suffix_recompute",
+    ]
+    assert stages[1][1] == stages[0][2]
+    assert abs(
+        stages[-1][2]
+        - planner.estimate_contiguous_prefix_seconds(
+            32, plan.recompute_tokens, batch_size=1, hidden_size=768
+        )
+    ) < 1e-12

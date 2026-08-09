@@ -36,10 +36,10 @@ class KVConnectorModelRunnerMixin:
     def _bind_experimental_forward_metadata(metadata=None) -> None:
         """Expose optional connector plans to model layers for this forward.
 
-        KVPR is deliberately not enabled by this hook.  Its scheduler plan is
-        advisory until a model-specific layer implements activation
-        materialization, but carrying it in ``additional_kwargs`` gives that
-        layer the same request-step lifetime as the ordinary KV connector.
+        The offloading scheduler already applies the contiguous-prefix split
+        for KVPR.  Carrying the plan in ``additional_kwargs`` also gives
+        model-specific instrumentation or future overlap kernels the same
+        request-step lifetime as the ordinary KV connector.
         """
         forward_context = get_forward_context()
         if metadata is None:

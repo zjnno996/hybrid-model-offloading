@@ -31,9 +31,9 @@ class OffloadingConnectorMetadata(KVConnectorMetadata):
     load_jobs: dict[int, TransferJob]
     store_jobs: dict[int, TransferJob]
     jobs_to_flush: set[int] | None = None
-    # Optional per-request KVPR plans.  Keeping this in connector metadata
-    # makes the plan available to an experimental model runner without
-    # changing the default contiguous KV transfer protocol.
+    # Optional per-request KVPR plans.  The scheduler consumes the plan to
+    # shorten a remote prefix; keeping it in connector metadata also makes the
+    # decision visible to model-side instrumentation and overlap kernels.
     kvpr_plans: dict[ReqId, KVPRPlan] = field(default_factory=dict)
 
 

@@ -1057,9 +1057,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         if "VLLM_PREFIX_CACHE_RETENTION_INTERVAL" in os.environ
         else None
     ),
-    # Enable the KVPR scheduler metadata path.  The default remains disabled
-    # because generic v1 execution still exposes contiguous external-prefix
-    # loads; experimental model runners may consume the emitted plan.
+    # Enable KVPR's experimental scheduler path.  It loads an aligned remote
+    # prefix and lets the ordinary model forward recompute the remaining
+    # prompt suffix.  The default remains disabled.
     "VLLM_KVPR_ENABLED": lambda: bool(
         int(os.getenv("VLLM_KVPR_ENABLED", "0"))
     ),

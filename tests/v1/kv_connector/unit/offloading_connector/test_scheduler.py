@@ -11,6 +11,7 @@ from tests.v1.kv_connector.unit.offloading_connector.utils import (
     to_keys,
 )
 from tests.v1.kv_connector.unit.utils import EOS_TOKEN_ID
+from vllm import envs
 from vllm.distributed.kv_events import BlockRemoved, BlockStored
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     OffloadingConnectorScheduler,
@@ -598,6 +599,7 @@ def test_two_groups_different_block_sizes(request_runner, async_scheduling: bool
     )
     runner.run(decoded_tokens=[EOS_TOKEN_ID])
 
+
     # Request with 48+37 matching tokens
     # 48 tokens will be hit on GPU
     # extra 32 tokens will be loaded
@@ -613,6 +615,42 @@ def test_two_groups_different_block_sizes(request_runner, async_scheduling: bool
         expected_loaded=((0, 4), (0, 5), (0, 6), (1, 3), (1, 4)),
     )
     runner.run(decoded_tokens=[EOS_TOKEN_ID])
+
+
+def test_kvpr_loads_prefix_and_recomputes_suffix(request_runner, monkeypatch):
+    """KVPR must shorten the real external prefix, not only emit metadata."""
+    monkeypatch.setattr(envs, "VLLM_KVPR_ENABLED", True)
+    monkeypatch.setattr(envs, "VLLM_KVPR_TOKEN_STEP", 4)
+
+    block_size = 4
+    runner = request_runner(
+        block_size=block_size,
+        num_gpu_blocks=100,
+        async_scheduling=True,
+        extra_config_overrides={"offload_prompt_only": True},
+    )
+
+    # Populate eight remote blocks for a 32-token prompt.
+    runner.new_request(token_ids=[0] * 32)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    runner.run(decoded_tokens=[0])
+    runner.run(decoded_tokens=[0] * 3, expected_stored=tuple(range(8)))
+    runner.run(decoded_tokens=[EOS_TOKEN_ID])
+    runner.scheduler.reset_prefix_cache()
+
+    # The default analytical model chooses a non-zero split for OPT's hidden
+    # size.  The scheduler-safe path therefore loads only the first aligned
+    # block and leaves the remaining prompt suffix to normal prefill.
+    runner.new_request(token_ids=[0] * 32)
+    runner.manager.lookup.return_value = True
+    runner.run(decoded_tokens=[0], expected_loaded=(0,))
+    plan = runner.connector_scheduler._req_status["1"].kvpr_plan
+    assert plan is not None
+    assert plan.loads_contiguous_prefix
+    assert plan.transfer_tokens == block_size
+    assert plan.recompute_tokens == 32 - block_size
 
 
 # ---------------------------------------------------------------------------
