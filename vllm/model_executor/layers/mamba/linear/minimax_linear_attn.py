@@ -341,7 +341,11 @@ class MiniMaxText01LinearAttention(LinearAttention):
                 if entries:
                     transition = self._hypic_cache.compose(entries)
                     assert transition is not None
-                    zero = torch.zeros_like(kv_cache[slot_id])
+                    zero = torch.zeros(
+                        kv_cache[slot_id].shape,
+                        device=kv_cache.device,
+                        dtype=transition.bias.dtype,
+                    )
                     kv_cache[slot_id].copy_(transition.apply(zero))
                     cached_tokens = sum(len(entry.token_ids) for entry in entries)
 
@@ -366,9 +370,9 @@ class MiniMaxText01LinearAttention(LinearAttention):
             )
             if cached_tokens < query_len:
                 tail_output = MiniMaxText01LinearKernel.jit_linear_forward_prefix(
-                    q[start + cached_tokens : end],
-                    k[start + cached_tokens : end],
-                    v[start + cached_tokens : end],
+                    q[start + cached_tokens : end].transpose(0, 1).contiguous(),
+                    k[start + cached_tokens : end].transpose(0, 1).contiguous(),
+                    v[start + cached_tokens : end].transpose(0, 1).contiguous(),
                     kv_cache[slot_id],
                     self.tp_slope,
                     self.BLOCK,

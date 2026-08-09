@@ -98,7 +98,10 @@ def test_hypic_minimax_prefill_composes_cached_segments(monkeypatch):
     def prefix(q, k, v, cache_state, slope, block_size, layer_idx=None):
         ratio = torch.exp(-slope).view(1, 1, 1)
         outputs = []
-        for q_t, k_t, v_t in zip(q, k, v):
+        for token_idx in range(q.shape[1]):
+            q_t = q[:, token_idx]
+            k_t = k[:, token_idx]
+            v_t = v[:, token_idx]
             cache_state.mul_(ratio)
             cache_state.add_(torch.einsum("hd,he->hde", k_t, v_t))
             outputs.append(torch.einsum("hd,hde->he", q_t, cache_state).reshape(-1))
