@@ -13,6 +13,12 @@ The implementation is torch-native and can be connected to vLLM's existing
 `LinearAttentionBackend` state indices without changing model-specific kernels.
 No author code was available for direct integration.
 
+`KVBufferBank` is the runtime-facing adapter: it owns buffers by
+`LinearAttentionMetadata.state_indices_tensor` slot ID and exposes
+`begin_speculative`, `accept_speculative`, `reject_speculative`, and `release`.
+This gives a model-specific linear-attention kernel a bounded, exact state
+container without changing vLLM's underlying Mamba state allocation.
+
 Validation:
 
 ```text

@@ -10,6 +10,7 @@ rollback without allocating a temporary full state.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Hashable, Sequence
 
 import torch
 
@@ -95,3 +96,65 @@ class KVBuffer:
             return
         self.state_kv.add_(keys.transpose(0, 1) @ values)
         self.state_z.add_(keys.sum(dim=0))
+
+
+class KVBufferBank:
+    """Own KVBuffer instances by vLLM linear-state slot ID.
+
+    ``LinearAttentionMetadata.state_indices_tensor`` can be used directly as
+    the key. The bank keeps speculative snapshots only for slots participating
+    in a draft step, so normal decode does not duplicate recurrent states.
+    """
+
+    def __init__(
+        self,
+        key_dim: int,
+        value_dim: int,
+        config: KVBufferConfig | None = None,
+        *,
+        device: torch.device | None = None,
+        dtype: torch.dtype = torch.float32,
+    ) -> None:
+        self.key_dim = key_dim
+        self.value_dim = value_dim
+        self.config = config or KVBufferConfig()
+        self.device = device
+        self.dtype = dtype
+        self._buffers: dict[Hashable, KVBuffer] = {}
+        self._speculative: dict[Hashable, KVBufferSnapshot] = {}
+
+    def get(self, state_id: Hashable) -> KVBuffer:
+        buffer = self._buffers.get(state_id)
+        if buffer is None:
+            buffer = KVBuffer(
+                self.key_dim,
+                self.value_dim,
+                self.config,
+                device=self.device,
+                dtype=self.dtype,
+            )
+            self._buffers[state_id] = buffer
+        return buffer
+
+    def begin_speculative(self, state_ids: Sequence[Hashable]) -> None:
+        """Snapshot each slot once before draft-token updates."""
+        for state_id in state_ids:
+            self._speculative.setdefault(state_id, self.get(state_id).snapshot())
+
+    def accept_speculative(self, state_ids: Sequence[Hashable]) -> None:
+        """Commit accepted draft-token updates by dropping their snapshots."""
+        for state_id in state_ids:
+            self._speculative.pop(state_id, None)
+
+    def reject_speculative(self, state_ids: Sequence[Hashable]) -> None:
+        """Restore slots whose draft tokens were rejected."""
+        for state_id in state_ids:
+            snapshot = self._speculative.pop(state_id, None)
+            if snapshot is not None:
+                self.get(state_id).rollback(snapshot)
+
+    def release(self, state_ids: Sequence[Hashable]) -> None:
+        """Drop state when vLLM releases its corresponding cache slots."""
+        for state_id in state_ids:
+            self._buffers.pop(state_id, None)
+            self._speculative.pop(state_id, None)

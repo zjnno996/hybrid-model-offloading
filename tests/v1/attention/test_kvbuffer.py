@@ -2,7 +2,11 @@
 
 import torch
 
-from vllm.v1.attention.backends.kvbuffer import KVBuffer, KVBufferConfig
+from vllm.v1.attention.backends.kvbuffer import (
+    KVBuffer,
+    KVBufferBank,
+    KVBufferConfig,
+)
 
 
 def test_kvbuffer_materialization_matches_direct_linear_attention():
@@ -33,3 +37,22 @@ def test_kvbuffer_large_append_flushes_until_capacity_is_respected():
     buf = KVBuffer(2, 1, KVBufferConfig(buffer_tokens=2, update_chunk_tokens=1))
     buf.append(torch.ones(10, 2), torch.ones(10, 1))
     assert buf.keys.shape[0] == 2
+
+
+def test_kvbuffer_bank_commits_or_rolls_back_per_state_slot():
+    bank = KVBufferBank(2, 1, KVBufferConfig(buffer_tokens=2))
+    bank.get(7).append(torch.ones(1, 2), torch.ones(1, 1))
+    baseline = bank.get(7).snapshot()
+
+    bank.begin_speculative((7,))
+    bank.get(7).append(torch.full((2, 2), 2.0), torch.full((2, 1), 3.0))
+    bank.reject_speculative((7,))
+    assert torch.equal(bank.get(7).keys, baseline.keys)
+    assert torch.equal(bank.get(7).state_kv, baseline.state_kv)
+
+    bank.begin_speculative((7,))
+    bank.get(7).append(torch.full((1, 2), 4.0), torch.full((1, 1), 5.0))
+    bank.accept_speculative((7,))
+    assert bank.get(7).keys.shape[0] == 2
+    bank.release((7,))
+    assert bank.get(7).keys.shape[0] == 0
