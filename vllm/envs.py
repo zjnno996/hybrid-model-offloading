@@ -283,6 +283,10 @@ if TYPE_CHECKING:
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
     VLLM_PREFIX_CACHE_RETENTION_INTERVAL: int | None = None
+    # Experimental KVBuffer state banking for linear-attention kernels.
+    VLLM_KVBUFFER_ENABLED: bool = False
+    VLLM_KVBUFFER_BUFFER_TOKENS: int = 64
+    VLLM_KVBUFFER_UPDATE_CHUNK_TOKENS: int = 64
 
 
 def get_default_cache_root():
@@ -1053,6 +1057,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.environ["VLLM_PREFIX_CACHE_RETENTION_INTERVAL"])
         if "VLLM_PREFIX_CACHE_RETENTION_INTERVAL" in os.environ
         else None
+    ),
+    "VLLM_KVBUFFER_ENABLED": lambda: bool(
+        int(os.getenv("VLLM_KVBUFFER_ENABLED", "0"))
+    ),
+    "VLLM_KVBUFFER_BUFFER_TOKENS": lambda: int(
+        os.getenv("VLLM_KVBUFFER_BUFFER_TOKENS", "64")
+    ),
+    "VLLM_KVBUFFER_UPDATE_CHUNK_TOKENS": lambda: int(
+        os.getenv("VLLM_KVBUFFER_UPDATE_CHUNK_TOKENS", "64")
     ),
     # a local directory to look in for unrecognized LoRA adapters.
     # only works if plugins are enabled and

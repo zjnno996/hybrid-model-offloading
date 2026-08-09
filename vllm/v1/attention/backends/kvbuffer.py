@@ -19,6 +19,18 @@ import torch
 class KVBufferConfig:
     buffer_tokens: int = 64
     update_chunk_tokens: int = 64
+    enabled: bool = True
+
+    @classmethod
+    def from_environment(cls) -> "KVBufferConfig":
+        """Read the opt-in settings used by a vLLM linear-attention adapter."""
+        from vllm import envs
+
+        return cls(
+            buffer_tokens=envs.VLLM_KVBUFFER_BUFFER_TOKENS,
+            update_chunk_tokens=envs.VLLM_KVBUFFER_UPDATE_CHUNK_TOKENS,
+            enabled=envs.VLLM_KVBUFFER_ENABLED,
+        )
 
 
 @dataclass
@@ -148,6 +160,24 @@ class KVBufferBank:
         self.dtype = dtype
         self._buffers: dict[Hashable, KVBuffer] = {}
         self._speculative: dict[Hashable, KVBufferSnapshot] = {}
+
+    @classmethod
+    def from_environment(
+        cls,
+        key_dim: int,
+        value_dim: int,
+        *,
+        device: torch.device | None = None,
+        dtype: torch.dtype = torch.float32,
+    ) -> "KVBufferBank":
+        """Construct the bank with explicit environment-controlled policy."""
+        return cls(
+            key_dim,
+            value_dim,
+            KVBufferConfig.from_environment(),
+            device=device,
+            dtype=dtype,
+        )
 
     def get(self, state_id: Hashable) -> KVBuffer:
         buffer = self._buffers.get(state_id)

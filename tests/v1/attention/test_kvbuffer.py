@@ -71,3 +71,8 @@ def test_kvbuffer_slot_export_and_restore_preserves_unflushed_tail():
         target.get(7).materialize(torch.tensor([[1.0, 1.0]])), expected
     )
     assert torch.equal(target.get(7).keys, source.get(7).keys)
+
+
+def test_kvbuffer_environment_factory_is_disabled_by_default():
+    bank = KVBufferBank.from_environment(2, 1)
+    assert bank.config.enabled is False
