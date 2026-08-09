@@ -9,6 +9,9 @@ from vllm.v1.kv_offload.kvpr import (
     KVPRExecutor,
     KVPRPlanner,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+    OffloadingConnectorMetadata,
+)
 
 
 def test_kvpr_plan_has_partial_recompute_for_pcie_bound_transfer():
@@ -103,3 +106,10 @@ def test_kvpr_executor_starts_recompute_and_suffix_after_activation():
     assert result.activation_result == "activation"
     assert result.recompute_result == "recompute"
     assert result.suffix_result == "suffix"
+
+
+def test_kvpr_plan_can_be_carried_in_offloading_metadata():
+    plan = KVPRPlanner().plan(64, 8, batch_size=1, hidden_size=32)
+    metadata = OffloadingConnectorMetadata(load_jobs={}, store_jobs={},
+                                           kvpr_plans={"request-1": plan})
+    assert metadata.kvpr_plans["request-1"] is plan

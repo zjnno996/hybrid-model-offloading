@@ -283,6 +283,9 @@ if TYPE_CHECKING:
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
     VLLM_PREFIX_CACHE_RETENTION_INTERVAL: int | None = None
+    # Experimental KVPR partial-recompute planning for offloaded prompts.
+    VLLM_KVPR_ENABLED: bool = False
+    VLLM_KVPR_TOKEN_STEP: int = 1
 
 
 def get_default_cache_root():
@@ -1054,6 +1057,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         if "VLLM_PREFIX_CACHE_RETENTION_INTERVAL" in os.environ
         else None
     ),
+    # Enable the KVPR scheduler metadata path.  The default remains disabled
+    # because generic v1 execution still exposes contiguous external-prefix
+    # loads; experimental model runners may consume the emitted plan.
+    "VLLM_KVPR_ENABLED": lambda: bool(
+        int(os.getenv("VLLM_KVPR_ENABLED", "0"))
+    ),
+    "VLLM_KVPR_TOKEN_STEP": lambda: int(os.getenv("VLLM_KVPR_TOKEN_STEP", "1")),
     # a local directory to look in for unrecognized LoRA adapters.
     # only works if plugins are enabled and
     # VLLM_ALLOW_RUNTIME_LORA_UPDATING is enabled.

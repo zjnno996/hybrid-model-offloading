@@ -7,6 +7,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorWorkerMetadata,
 )
 from vllm.v1.kv_offload.worker.worker import TransferSpec
+from vllm.v1.kv_offload.kvpr import KVPRPlan
 
 ReqId = str
 
@@ -30,6 +31,10 @@ class OffloadingConnectorMetadata(KVConnectorMetadata):
     load_jobs: dict[int, TransferJob]
     store_jobs: dict[int, TransferJob]
     jobs_to_flush: set[int] | None = None
+    # Optional per-request KVPR plans.  Keeping this in connector metadata
+    # makes the plan available to an experimental model runner without
+    # changing the default contiguous KV transfer protocol.
+    kvpr_plans: dict[ReqId, KVPRPlan] = field(default_factory=dict)
 
 
 @dataclass

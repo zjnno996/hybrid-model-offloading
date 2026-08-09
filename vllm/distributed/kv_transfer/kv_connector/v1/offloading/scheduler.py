@@ -6,6 +6,7 @@ from itertools import islice
 from typing import Any, NamedTuple
 
 from vllm.distributed.kv_events import BlockRemoved, BlockStored, KVCacheEvent
+from vllm import envs
 from vllm.distributed.kv_transfer.kv_connector.utils import yield_req_data
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
@@ -35,6 +36,7 @@ from vllm.v1.kv_offload.base import (
     get_offload_block_hash,
     make_offload_key,
 )
+from vllm.v1.kv_offload.kvpr import KVPRConfig, KVPRPlan, KVPRPlanner
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
@@ -186,6 +188,10 @@ class RequestOffloadState:
     # In-flight job IDs. Per the connector's invariant, at any given time
     # this contains either a single load job, or one or more store jobs.
     transfer_jobs: set[int] = field(default_factory=set)
+    # Set only when the experimental KVPR switch is enabled and a remote
+    # prefix hit is found.  The scheduler still uses the existing contiguous
+    # load protocol unless a model runner explicitly consumes this plan.
+    kvpr_plan: KVPRPlan | None = None
 
     def __post_init__(self) -> None:
         self.group_states = tuple(
@@ -262,6 +268,14 @@ class OffloadingConnectorScheduler:
     def __init__(self, spec: OffloadingSpec):
         self.config = SchedulerOffloadConfig.from_spec(spec)
         self.manager: OffloadingManager = spec.get_manager()
+        self._kvpr_planner: KVPRPlanner | None = None
+        self._kvpr_hidden_size: int | None = None
+        if envs.VLLM_KVPR_ENABLED:
+            hidden_size = spec.vllm_config.model_config.get_hidden_size()
+            self._kvpr_hidden_size = hidden_size
+            self._kvpr_planner = KVPRPlanner(
+                KVPRConfig(token_step=envs.VLLM_KVPR_TOKEN_STEP)
+            )
 
         full_attention_groups: list[int] = []
         sliding_window_groups: list[int] = []
@@ -564,11 +578,46 @@ class OffloadingConnectorScheduler:
         req_status.num_locally_computed_tokens = num_computed_tokens
 
         num_hit_tokens = self._lookup(req_status)
+        req_status.kvpr_plan = None
+        if (
+            self._kvpr_planner is not None
+            and self._kvpr_hidden_size is not None
+            and num_hit_tokens is not None
+            and num_hit_tokens > 0
+        ):
+            req_status.kvpr_plan = self._make_kvpr_plan(
+                request, num_hit_tokens, self._kvpr_hidden_size
+            )
         req_status.update_num_hit_blocks(num_computed_tokens + (num_hit_tokens or 0))
 
         self._touch(req_status)
 
         return num_hit_tokens, bool(num_hit_tokens)
+
+    def _make_kvpr_plan(
+        self, request: Request, num_hit_tokens: int, hidden_size: int
+    ) -> KVPRPlan:
+        assert self._kvpr_planner is not None
+        prompt_tokens = max(0, request.num_prompt_tokens)
+        generation_tokens = max(0, request.num_tokens - prompt_tokens)
+        plan = self._kvpr_planner.plan(
+            prompt_tokens=prompt_tokens,
+            generation_tokens=generation_tokens,
+            batch_size=1,
+            hidden_size=hidden_size,
+        )
+        # The existing connector reports only a block-aligned hit.  Clamp the
+        # advisory plan to the actually available hit; this prevents metadata
+        # from claiming a suffix that the backend did not find.
+        recompute_tokens = min(plan.recompute_tokens, num_hit_tokens)
+        return KVPRPlan(
+            total_tokens=plan.total_tokens,
+            recompute_tokens=recompute_tokens,
+            transfer_tokens=plan.total_tokens - recompute_tokens,
+            estimated_seconds=plan.estimated_seconds,
+            activation_bytes=plan.activation_bytes,
+            kv_bytes=plan.kv_bytes,
+        )
 
     def update_state_after_alloc(
         self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
@@ -934,6 +983,11 @@ class OffloadingConnectorScheduler:
             load_jobs=self._current_batch_load_jobs,
             store_jobs=self._build_store_jobs(scheduler_output),
             jobs_to_flush=self._current_batch_jobs_to_flush,
+            kvpr_plans={
+                req_id: req_status.kvpr_plan
+                for req_id, req_status in self._req_status.items()
+                if req_status.kvpr_plan is not None
+            },
         )
         self._current_batch_load_jobs = {}
         self._current_batch_jobs_to_flush = set()
