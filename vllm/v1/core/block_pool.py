@@ -10,7 +10,9 @@ from vllm.distributed.kv_events import (
     BlockStored,
     KVCacheEvent,
 )
+from vllm import envs
 from vllm.logger import init_logger
+from vllm.v1.core.marconi_policy import MarconiEntry, MarconiPolicy, MarconiPolicyConfig
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -153,6 +155,7 @@ class BlockPool:
         hash_block_size: int,
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        marconi_config: MarconiPolicyConfig | None = None,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
@@ -180,6 +183,18 @@ class BlockPool:
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
+        if marconi_config is None and envs.VLLM_MARCONI_CACHE_POLICY:
+            marconi_config = MarconiPolicyConfig(
+                efficiency_weight=envs.VLLM_MARCONI_EFFICIENCY_WEIGHT,
+                min_admission_efficiency=(
+                    envs.VLLM_MARCONI_MIN_ADMISSION_EFFICIENCY
+                ),
+            )
+        self.marconi_policy = (
+            MarconiPolicy(marconi_config) if marconi_config is not None else None
+        )
+        self._marconi_entries: dict[int, MarconiEntry] = {}
+        self._marconi_clock = 0
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -208,6 +223,68 @@ class BlockPool:
             cached_blocks.append(block)
         return cached_blocks
 
+    def register_marconi_entry(
+        self,
+        block: KVCacheBlock,
+        *,
+        state_bytes: int,
+        compute_savings: float,
+    ) -> bool:
+        """Register an admitted cached block with the optional Marconi policy."""
+        if self.marconi_policy is None:
+            return True
+        self._marconi_clock += 1
+        entry = MarconiEntry(
+            key=block.block_id,
+            state_bytes=state_bytes,
+            compute_savings=compute_savings,
+            last_access=self._marconi_clock,
+            reuse_probability=self.marconi_policy.config.initial_reuse_probability,
+        )
+        if not self.marconi_policy.should_admit(entry):
+            return False
+        self._marconi_entries[block.block_id] = entry
+        return True
+
+    def _touch_marconi_entry(self, block: KVCacheBlock) -> None:
+        if self.marconi_policy is None:
+            return
+        entry = self._marconi_entries.get(block.block_id)
+        if entry is None:
+            return
+        self._marconi_clock += 1
+        alpha = self.marconi_policy.config.hit_reuse_alpha
+        self._marconi_entries[block.block_id] = MarconiEntry(
+            key=entry.key,
+            state_bytes=entry.state_bytes,
+            compute_savings=entry.compute_savings,
+            last_access=self._marconi_clock,
+            reuse_probability=entry.reuse_probability
+            + alpha * (1.0 - entry.reuse_probability),
+        )
+
+    def _reorder_marconi_eviction_queue(self) -> None:
+        """Put untracked blocks first, then lowest Marconi utility first."""
+        if self.marconi_policy is None:
+            return
+        free_count = self.free_block_queue.num_free_blocks
+        if free_count <= 1:
+            return
+        free_blocks = self.free_block_queue.popleft_n(free_count)
+        entries = [
+            self._marconi_entries[block.block_id]
+            for block in free_blocks
+            if block.block_id in self._marconi_entries
+        ]
+        scores = self.marconi_policy.eviction_scores(entries, now=self._marconi_clock)
+        free_blocks.sort(
+            key=lambda block: (
+                block.block_id in self._marconi_entries,
+                scores.get(block.block_id, float("-inf")),
+            )
+        )
+        self.free_block_queue.append_n(free_blocks)
+
     def cache_full_blocks(
         self,
         request: Request,
@@ -217,6 +294,7 @@ class BlockPool:
         block_size: int,
         kv_cache_group_id: int,
         block_mask: list[bool] | None = None,
+        marconi_state_bytes: int | None = None,
     ) -> None:
         """Cache a list of full blocks for prefix caching.
         This function takes a list of blocks that will have their block hash
@@ -273,7 +351,17 @@ class BlockPool:
             assert blk.block_hash is None
             block_hash = new_block_hashes[i]
 
-            # Update and added the full block to the cache.
+            # Use the block end position as a hardware-agnostic estimate of
+            # recomputation avoided by a prefix hit. Callers pass actual cache
+            # bytes from their KV spec.
+            if marconi_state_bytes is not None and not self.register_marconi_entry(
+                blk,
+                state_bytes=marconi_state_bytes,
+                compute_savings=(num_cached_blocks + i + 1) * block_size,
+            ):
+                continue
+
+            # Update and add the full block to the cache.
             block_hash_with_group_id = make_block_hash_with_group_id(
                 block_hash, kv_cache_group_id
             )
@@ -373,7 +461,8 @@ class BlockPool:
         Returns:
             True if the block is evicted, False otherwise.
         """
-        # Clean up metrics tracking first to prevent leaks
+        # Clean up policy/metrics tracking first to prevent leaks.
+        self._marconi_entries.pop(block.block_id, None)
         if self.metrics_collector:
             self.metrics_collector.on_block_evicted(block)
 
@@ -413,6 +502,7 @@ class BlockPool:
             if block.ref_cnt == 0 and not block.is_null:
                 self.free_block_queue.remove(block)
             block.ref_cnt += 1
+            self._touch_marconi_entry(block)
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
 
@@ -439,6 +529,7 @@ class BlockPool:
             self.free_block_queue.prepend_n(freed_blocks)
         else:
             self.free_block_queue.append_n(freed_blocks)
+        self._reorder_marconi_eviction_queue()
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
@@ -479,6 +570,7 @@ class BlockPool:
 
         # Remove all hashes so that no new blocks will hit.
         self.cached_block_hash_to_block = BlockHashToBlockMap()
+        self._marconi_entries.clear()
 
         # Remove all hashes from all blocks.
         for block in self.blocks:

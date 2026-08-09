@@ -50,6 +50,10 @@ class MarconiPolicyConfig:
     efficiency_weight: float = 1.0
     # Do not admit entries whose expected savings per byte is below this value.
     min_admission_efficiency: float = 0.0
+    # Prior used before a cached prefix is observed to be reused.
+    initial_reuse_probability: float = 0.25
+    # EWMA update applied when a prefix-cache hit touches an entry.
+    hit_reuse_alpha: float = 0.5
 
 
 class MarconiPolicy:

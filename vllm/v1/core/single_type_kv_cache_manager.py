@@ -336,6 +336,7 @@ class SingleTypeKVCacheManager(ABC):
             block_size=self.block_size,
             kv_cache_group_id=self.kv_cache_group_id,
             block_mask=block_mask,
+            marconi_state_bytes=self.kv_cache_spec.page_size_bytes,
         )
 
         self.num_cached_block[request.request_id] = num_full_blocks

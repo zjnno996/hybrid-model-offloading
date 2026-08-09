@@ -18,3 +18,12 @@ The implementation is covered by
 behavioral baseline is in `/data/vllm-paper-references/Marconi`.
 
 Benchmark: `python benchmarks/reproductions/marconi_mlsys25.py`.
+
+## Experimental vLLM integration
+
+Set `VLLM_MARCONI_CACHE_POLICY=1` to enable the policy in `BlockPool`.  Newly
+completed cache blocks are admitted using their KV/state page bytes and an
+estimated prefix-recompute saving; released cache blocks are reordered by the
+Marconi eviction score. `VLLM_MARCONI_EFFICIENCY_WEIGHT` and
+`VLLM_MARCONI_MIN_ADMISSION_EFFICIENCY` tune retention and admission. The
+default is disabled and retains vLLM's original queue behavior.

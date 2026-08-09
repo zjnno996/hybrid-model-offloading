@@ -283,6 +283,9 @@ if TYPE_CHECKING:
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
     VLLM_PREFIX_CACHE_RETENTION_INTERVAL: int | None = None
+    VLLM_MARCONI_CACHE_POLICY: bool = False
+    VLLM_MARCONI_EFFICIENCY_WEIGHT: float = 1.0
+    VLLM_MARCONI_MIN_ADMISSION_EFFICIENCY: float = 0.0
 
 
 def get_default_cache_root():
@@ -1048,11 +1051,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # retains only the latest completed prompt boundary. Positive values retain
     # checkpoints at the specified interval boundaries (rounded up to the
     # prefix-cache alignment).
-    # Applies to sliding-window attention for now but not yet Mamba/linear attention.
+    # Applies to sliding-window and Mamba/linear attention.
     "VLLM_PREFIX_CACHE_RETENTION_INTERVAL": lambda: (
         int(os.environ["VLLM_PREFIX_CACHE_RETENTION_INTERVAL"])
         if "VLLM_PREFIX_CACHE_RETENTION_INTERVAL" in os.environ
         else None
+    ),
+    # Experimental Marconi hybrid-cache admission/eviction policy.
+    "VLLM_MARCONI_CACHE_POLICY": lambda: (
+        os.getenv("VLLM_MARCONI_CACHE_POLICY", "False").lower() in ("true", "1")
+    ),
+    "VLLM_MARCONI_EFFICIENCY_WEIGHT": lambda: float(
+        os.getenv("VLLM_MARCONI_EFFICIENCY_WEIGHT", "1.0")
+    ),
+    "VLLM_MARCONI_MIN_ADMISSION_EFFICIENCY": lambda: float(
+        os.getenv("VLLM_MARCONI_MIN_ADMISSION_EFFICIENCY", "0.0")
     ),
     # a local directory to look in for unrecognized LoRA adapters.
     # only works if plugins are enabled and
