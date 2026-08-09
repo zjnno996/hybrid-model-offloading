@@ -13,6 +13,13 @@ operators while recomputing only the boundary seam.
 Mamba/GDN state shape.  `HypicPlanner.recovery_plan()` gives the scheduler the
 number of complete cached segments and seam tokens to execute.
 
+`HypicSegmentCache` now ports the PICache lookup contract from the official
+artifact: non-final segments may hit independently, cached token IDs are
+checked after hashing, and `transition_rope_recompute` style policies report
+only the interior seam ranges that the model kernel must replay. This is the
+runtime-facing cache component; applying RoPE re-rotation remains specific to
+the supported model kernel.
+
 Validation:
 
 ```text

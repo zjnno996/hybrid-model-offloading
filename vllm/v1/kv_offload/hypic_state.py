@@ -10,7 +10,9 @@ owning a model-specific state layout.
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
+from enum import Enum
 from typing import Sequence
 
 
@@ -38,6 +40,132 @@ class HypicRecoveryPlan:
     cached_segments: int
     boundary_tokens: int
     seam_recompute_tokens: int
+
+
+class HypicComposeMode(str, Enum):
+    """Cache payloads used by the official HYPIC/PIC policies."""
+
+    ADDITION = "addition"
+    TRANSITION = "transition"
+
+
+@dataclass(frozen=True)
+class HypicPolicy:
+    """Position-independent segment-cache policy.
+
+    ``recompute_seam`` corresponds to HYPIC's
+    ``transition_rope_recompute`` mode. RoPE re-rotation itself is model
+    kernel-specific, so this generic policy reports the seam tokens that must
+    be replayed rather than attempting a model-agnostic rotation.
+    """
+
+    compose_mode: HypicComposeMode = HypicComposeMode.TRANSITION
+    recompute_seam: bool = True
+    seam_tokens: int = 1
+
+    def __post_init__(self) -> None:
+        if self.seam_tokens < 0:
+            raise ValueError("seam_tokens must be non-negative")
+
+
+@dataclass(frozen=True)
+class HypicSegmentEntry:
+    """One position-independent cached segment and its zero-start state."""
+
+    key: bytes
+    token_ids: tuple[int, ...]
+    transition: HypicTransition
+
+
+@dataclass(frozen=True)
+class HypicMatch:
+    """Lookup result for a segmented prompt."""
+
+    ranges: tuple[tuple[int, int], ...]
+    entries: tuple[HypicSegmentEntry | None, ...]
+    seam_ranges: tuple[tuple[int, int], ...]
+
+    @property
+    def hit_segments(self) -> int:
+        return sum(entry is not None for entry in self.entries)
+
+    @property
+    def hit_tokens(self) -> int:
+        return sum(
+            end - start
+            for (start, end), entry in zip(self.ranges, self.entries)
+            if entry is not None
+        )
+
+
+class HypicSegmentCache:
+    """In-memory segment cache matching HYPIC's PIC hit semantics.
+
+    Any non-final segment may hit independently. The token tuple is retained
+    alongside the hash to make collisions harmless. A caller obtains
+    ``seam_ranges`` and sends only those tokens through its model-specific
+    re-rotation/recompute path.
+    """
+
+    def __init__(self, segment_tokens: int = 128, policy: HypicPolicy | None = None):
+        if segment_tokens <= 0:
+            raise ValueError("segment_tokens must be positive")
+        self.segment_tokens = segment_tokens
+        self.policy = policy or HypicPolicy()
+        self._entries: dict[bytes, HypicSegmentEntry] = {}
+
+    def segment_ranges(self, token_count: int) -> tuple[tuple[int, int], ...]:
+        if token_count < 0:
+            raise ValueError("token_count must be non-negative")
+        return tuple(
+            (start, min(start + self.segment_tokens, token_count))
+            for start in range(0, token_count, self.segment_tokens)
+        )
+
+    def put(self, token_ids: Sequence[int], transition: HypicTransition) -> HypicSegmentEntry:
+        tokens = tuple(int(token) for token in token_ids)
+        if not tokens:
+            raise ValueError("cannot cache an empty segment")
+        key = self._segment_key(tokens)
+        existing = self._entries.get(key)
+        if existing is not None and existing.token_ids == tokens:
+            return existing
+        entry = HypicSegmentEntry(key, tokens, transition)
+        self._entries[key] = entry
+        return entry
+
+    def match(self, token_ids: Sequence[int]) -> HypicMatch:
+        tokens = tuple(int(token) for token in token_ids)
+        ranges = self.segment_ranges(len(tokens))
+        entries: list[HypicSegmentEntry | None] = []
+        seams: list[tuple[int, int]] = []
+        for index, (start, end) in enumerate(ranges):
+            # The last segment is the active query tail and is recomputed.
+            if index == len(ranges) - 1:
+                entries.append(None)
+                continue
+            segment = tokens[start:end]
+            entry = self._entries.get(self._segment_key(segment))
+            if entry is None or entry.token_ids != segment:
+                entries.append(None)
+                continue
+            entries.append(entry)
+            if self.policy.recompute_seam and index > 0:
+                seam_end = min(end, start + self.policy.seam_tokens)
+                if seam_end > start:
+                    seams.append((start, seam_end))
+        return HypicMatch(ranges, tuple(entries), tuple(seams))
+
+    def compose(self, entries: Sequence[HypicSegmentEntry]) -> HypicTransition | None:
+        """Compose a contiguous ordered run of cached segment transitions."""
+        return HypicPlanner.compose_segments([entry.transition for entry in entries])
+
+    @staticmethod
+    def _segment_key(tokens: tuple[int, ...]) -> bytes:
+        hasher = hashlib.blake2b(digest_size=16)
+        for token in tokens:
+            hasher.update(token.to_bytes(8, "little", signed=True))
+        return hasher.digest()
 
 
 class HypicPlanner:
@@ -69,4 +197,3 @@ class HypicPlanner:
         for transition in transitions:
             result = transition if result is None else transition.compose(result)
         return result
-
