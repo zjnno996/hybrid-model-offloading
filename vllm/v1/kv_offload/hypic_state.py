@@ -62,10 +62,18 @@ class HypicPolicy:
     compose_mode: HypicComposeMode = HypicComposeMode.TRANSITION
     recompute_seam: bool = True
     seam_tokens: int = 1
+    enabled: bool = True
 
     def __post_init__(self) -> None:
         if self.seam_tokens < 0:
             raise ValueError("seam_tokens must be non-negative")
+
+    @classmethod
+    def from_environment(cls) -> "HypicPolicy":
+        """Build the opt-in policy used by a vLLM integration."""
+        from vllm import envs
+
+        return cls(enabled=envs.VLLM_HYPIC_ENABLED)
 
 
 @dataclass(frozen=True)
@@ -114,6 +122,16 @@ class HypicSegmentCache:
         self.policy = policy or HypicPolicy()
         self._entries: dict[bytes, HypicSegmentEntry] = {}
 
+    @classmethod
+    def from_environment(cls) -> "HypicSegmentCache":
+        """Create the explicitly enabled/disabled vLLM experiment cache."""
+        from vllm import envs
+
+        return cls(
+            segment_tokens=envs.VLLM_HYPIC_SEGMENT_TOKENS,
+            policy=HypicPolicy.from_environment(),
+        )
+
     def segment_ranges(self, token_count: int) -> tuple[tuple[int, int], ...]:
         if token_count < 0:
             raise ValueError("token_count must be non-negative")
@@ -137,6 +155,8 @@ class HypicSegmentCache:
     def match(self, token_ids: Sequence[int]) -> HypicMatch:
         tokens = tuple(int(token) for token in token_ids)
         ranges = self.segment_ranges(len(tokens))
+        if not self.policy.enabled:
+            return HypicMatch(ranges, tuple(None for _ in ranges), ())
         entries: list[HypicSegmentEntry | None] = []
         seams: list[tuple[int, int]] = []
         for index, (start, end) in enumerate(ranges):

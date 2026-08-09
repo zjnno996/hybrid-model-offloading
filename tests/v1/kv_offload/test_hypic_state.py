@@ -49,3 +49,13 @@ def test_hypic_segment_cache_validates_hash_with_tokens():
     # Simulate a digest collision; the token tuple prevents a false hit.
     cache._entries[cache._segment_key((9, 9))] = entry
     assert cache.match((9, 9, 3)).hit_segments == 0
+
+
+def test_hypic_disabled_policy_keeps_cache_entries_inert():
+    cache = HypicSegmentCache(
+        segment_tokens=3,
+        policy=HypicPolicy(enabled=False),
+    )
+    transition = HypicTransition(torch.eye(2), torch.zeros(2))
+    cache.put((1, 2, 3), transition)
+    assert cache.match((1, 2, 3, 4)).hit_segments == 0
