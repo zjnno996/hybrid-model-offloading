@@ -33,6 +33,22 @@ logger = init_logger(__name__)
 # Defined as a kv connector functionality mixin for ModelRunner (GPU, TPU)
 class KVConnectorModelRunnerMixin:
     @staticmethod
+    def _bind_experimental_forward_metadata(metadata=None) -> None:
+        """Expose optional connector plans to model layers for this forward.
+
+        KVPR is deliberately not enabled by this hook.  Its scheduler plan is
+        advisory until a model-specific layer implements activation
+        materialization, but carrying it in ``additional_kwargs`` gives that
+        layer the same request-step lifetime as the ordinary KV connector.
+        """
+        forward_context = get_forward_context()
+        if metadata is None:
+            metadata = get_kv_transfer_group()._get_connector_metadata()
+        kvpr_plans = getattr(metadata, "kvpr_plans", None)
+        if kvpr_plans:
+            forward_context.additional_kwargs["kvpr_plans"] = kvpr_plans
+
+    @staticmethod
     def kv_connector_no_forward(
         scheduler_output: "SchedulerOutput", vllm_config: VllmConfig
     ) -> ModelRunnerOutput:
@@ -87,6 +103,7 @@ class KVConnectorModelRunnerMixin:
         assert isinstance(kv_connector, KVConnectorBase)
         assert scheduler_output.kv_connector_metadata is not None
         kv_connector.bind_connector_metadata(scheduler_output.kv_connector_metadata)
+        KVConnectorModelRunnerMixin._bind_experimental_forward_metadata()
 
         # Background KV cache transfers happen here.
         # These transfers are designed to be async and the requests

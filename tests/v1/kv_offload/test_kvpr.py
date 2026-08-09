@@ -12,6 +12,9 @@ from vllm.v1.kv_offload.kvpr import (
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingConnectorMetadata,
 )
+from vllm.v1.worker.kv_connector_model_runner_mixin import (
+    KVConnectorModelRunnerMixin,
+)
 
 
 def test_kvpr_plan_has_partial_recompute_for_pcie_bound_transfer():
@@ -113,3 +116,17 @@ def test_kvpr_plan_can_be_carried_in_offloading_metadata():
     metadata = OffloadingConnectorMetadata(load_jobs={}, store_jobs={},
                                            kvpr_plans={"request-1": plan})
     assert metadata.kvpr_plans["request-1"] is plan
+
+
+def test_kvpr_metadata_is_exposed_to_forward_context(monkeypatch):
+    plan = KVPRPlanner().plan(64, 8, batch_size=1, hidden_size=32)
+    metadata = OffloadingConnectorMetadata(
+        load_jobs={}, store_jobs={}, kvpr_plans={"request-1": plan}
+    )
+    context = type("Context", (), {"additional_kwargs": {}})()
+    monkeypatch.setattr(
+        "vllm.v1.worker.kv_connector_model_runner_mixin.get_forward_context",
+        lambda: context,
+    )
+    KVConnectorModelRunnerMixin._bind_experimental_forward_metadata(metadata)
+    assert context.additional_kwargs["kvpr_plans"]["request-1"] is plan
