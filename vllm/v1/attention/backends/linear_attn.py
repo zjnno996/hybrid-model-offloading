@@ -42,6 +42,7 @@ class LinearAttentionMetadata:
     seq_lens: torch.Tensor
 
     state_indices_tensor: torch.Tensor  # shape: [batch,]
+    request_ids: tuple[str, ...] | None = None
 
 
 class LinearAttentionMetadataBuilder(AttentionMetadataBuilder[LinearAttentionMetadata]):
@@ -89,5 +90,6 @@ class LinearAttentionMetadataBuilder(AttentionMetadataBuilder[LinearAttentionMet
             query_start_loc=query_start_loc,
             seq_lens=seq_lens,
             state_indices_tensor=state_indices_tensor,
+            request_ids=common_attn_metadata.request_ids,
         )
         return attn_metadata

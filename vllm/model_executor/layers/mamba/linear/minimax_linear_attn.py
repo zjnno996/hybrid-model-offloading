@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 
+import vllm.envs as envs
 from vllm.config import get_current_vllm_config
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.model_executor.custom_op import PluggableLayer
@@ -21,6 +22,10 @@ from vllm.model_executor.layers.minimax_rms_norm import MiniMaxText01RMSNormTP
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.attention.backends.linear_attn import LinearAttentionMetadata
+from vllm.v1.kv_offload.hypic_state import (
+    HypicSegmentCache,
+    HypicTransition,
+)
 
 
 def clear_linear_attention_cache_for_new_sequences(
@@ -147,6 +152,26 @@ class MiniMaxText01LinearKernel:
         return rearrange(output.squeeze(0), "h n d -> n (h d)")
 
 
+def _hypic_transition(
+    keys: torch.Tensor, values: torch.Tensor, slope_rate: torch.Tensor
+) -> HypicTransition:
+    """Build a MiniMax affine state transition for one complete segment."""
+    token_count, heads, dim = keys.shape
+    state = torch.zeros(
+        (heads, dim, values.shape[-1]), device=keys.device, dtype=keys.dtype
+    )
+    ratios = torch.exp(-slope_rate.reshape(-1).to(torch.float32)).to(keys.dtype)
+    for token_idx in range(token_count):
+        state = ratios.view(heads, 1, 1) * state + torch.einsum(
+            "hd,he->hde", keys[token_idx], values[token_idx]
+        )
+    identity = torch.eye(dim, device=keys.device, dtype=keys.dtype).expand(
+        heads, dim, dim
+    )
+    matrix = identity * ratios.pow(token_count).view(heads, 1, 1)
+    return HypicTransition(matrix=matrix, bias=state)
+
+
 @PluggableLayer.register("minimax_text_01_attention")
 class MiniMaxText01LinearAttention(LinearAttention):
     def __init__(
@@ -197,6 +222,10 @@ class MiniMaxText01LinearAttention(LinearAttention):
         self.tp_slope = self.slope_rate[
             self.tp_rank * self.tp_heads : (self.tp_rank + 1) * self.tp_heads
         ].contiguous()
+        self._hypic_enabled = envs.VLLM_HYPIC_ENABLED
+        self._hypic_cache = (
+            HypicSegmentCache.from_environment() if self._hypic_enabled else None
+        )
 
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -234,6 +263,10 @@ class MiniMaxText01LinearAttention(LinearAttention):
     def _prefill_and_mix_infer(
         self, q, k, v, kv_cache, state_indices_tensor, attn_metadata
     ):
+        if self._hypic_enabled:
+            return self._hypic_prefill_and_mix_infer(
+                q, k, v, kv_cache, state_indices_tensor, attn_metadata
+            )
         return linear_attention_prefill_and_mix(
             q=q,
             k=k,
@@ -247,6 +280,110 @@ class MiniMaxText01LinearAttention(LinearAttention):
             prefix_fn=MiniMaxText01LinearKernel.jit_linear_forward_prefix,
             layer_idx=self.layer_idx,
         )
+
+    def _hypic_prefill_and_mix_infer(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        kv_cache: torch.Tensor,
+        state_indices_tensor: torch.Tensor,
+        attn_metadata: LinearAttentionMetadata,
+    ) -> torch.Tensor:
+        """Compose cached MiniMax segment states on a new prompt.
+
+        HYPIC is only applied to a fresh full-prompt prefill.  Existing
+        continuation chunks use the ordinary kernel because their earlier
+        token activations are not present in this forward call.  This keeps
+        chunked-prefill and prompt-logprob behavior exact by construction.
+        """
+        assert self._hypic_cache is not None
+        token_map = get_forward_context().additional_kwargs.get(
+            "hypic_request_tokens", {}
+        )
+        allow_prefix_reuse = get_forward_context().additional_kwargs.get(
+            "hypic_allow_prefix_reuse", True
+        )
+        request_ids = attn_metadata.request_ids
+        hidden: list[torch.Tensor] = []
+        offset = attn_metadata.num_decode_tokens
+
+        if attn_metadata.num_decode_tokens > 0:
+            hidden.append(
+                self._decode_infer(
+                    q, k, v, kv_cache, state_indices_tensor, attn_metadata
+                )
+            )
+
+        for prefill_idx in range(attn_metadata.num_prefills):
+            start = attn_metadata.query_start_loc[offset + prefill_idx]
+            end = attn_metadata.query_start_loc[offset + prefill_idx + 1]
+            query_len = end - start
+            batch_idx = offset + prefill_idx
+            context_len = attn_metadata.seq_lens[batch_idx] - query_len
+            slot_id = state_indices_tensor[batch_idx]
+            request_id = request_ids[batch_idx] if request_ids else None
+            tokens = token_map.get(request_id) if request_id is not None else None
+
+            cached_tokens = 0
+            if (
+                allow_prefix_reuse
+                and context_len == 0
+                and tokens is not None
+                and len(tokens) == query_len
+            ):
+                match = self._hypic_cache.match(tokens)
+                entries = []
+                for entry in match.entries:
+                    if entry is None:
+                        break
+                    entries.append(entry)
+                if entries:
+                    transition = self._hypic_cache.compose(entries)
+                    assert transition is not None
+                    zero = torch.zeros_like(kv_cache[slot_id])
+                    kv_cache[slot_id].copy_(transition.apply(zero))
+                    cached_tokens = sum(len(entry.token_ids) for entry in entries)
+
+                # Populate missing complete segments while the full prompt is
+                # available. The final active segment is intentionally left to
+                # normal execution, matching PIC/HYPIC seam semantics.
+                for seg_start, seg_end in self._hypic_cache.segment_ranges(len(tokens))[:-1]:
+                    segment_tokens = tokens[seg_start:seg_end]
+                    if not segment_tokens:
+                        continue
+                    self._hypic_cache.put(
+                        segment_tokens,
+                        _hypic_transition(
+                            k[start + seg_start : start + seg_end],
+                            v[start + seg_start : start + seg_end],
+                            self.tp_slope,
+                        ),
+                    )
+
+            output = torch.zeros(
+                (query_len, q.shape[1], v.shape[2]), device=q.device, dtype=q.dtype
+            )
+            if cached_tokens < query_len:
+                tail_output = MiniMaxText01LinearKernel.jit_linear_forward_prefix(
+                    q[start + cached_tokens : end],
+                    k[start + cached_tokens : end],
+                    v[start + cached_tokens : end],
+                    kv_cache[slot_id],
+                    self.tp_slope,
+                    self.BLOCK,
+                    layer_idx=self.layer_idx,
+                )
+                if tail_output.ndim == 2:
+                    tail_output = tail_output.view(
+                        -1, q.shape[1], v.shape[2]
+                    )
+                output[cached_tokens:] = tail_output
+            hidden.append(output.reshape(query_len, -1).contiguous())
+
+        if not hidden:
+            return torch.empty((0, q.shape[1] * q.shape[2]), device=q.device, dtype=q.dtype)
+        return torch.cat(hidden, dim=0).contiguous()
 
     def _decode_infer(self, q, k, v, kv_cache, state_indices_tensor, attn_metadata):
         hidden = linear_attention_decode(

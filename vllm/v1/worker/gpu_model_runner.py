@@ -52,6 +52,7 @@ from vllm.distributed.parallel_state import (
 from vllm.distributed.weight_transfer.base import SparseWeightPatch
 from vllm.forward_context import (
     BatchDescriptor,
+    get_forward_context,
     set_forward_context,
 )
 from vllm.logger import init_logger
@@ -2302,6 +2303,11 @@ class GPUModelRunner(
             causal=True,
             is_prefilling=is_prefilling,
             positions=self.positions[:num_tokens_padded],
+            request_ids=(
+                tuple(self.input_batch.req_ids[:num_reqs_padded])
+                if envs.VLLM_HYPIC_ENABLED
+                else None
+            ),
         )
 
         if self.dcp_world_size > 1:
@@ -4278,6 +4284,21 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            if envs.VLLM_HYPIC_ENABLED:
+                hypic_request_tokens = {}
+                for req_id in self.input_batch.req_ids[:num_reqs]:
+                    request = self.requests.get(req_id)
+                    if request is None or request.prompt_token_ids is None:
+                        continue
+                    hypic_request_tokens[req_id] = tuple(
+                        request.prompt_token_ids[: request.num_prompt_tokens]
+                    )
+                get_forward_context().additional_kwargs[
+                    "hypic_request_tokens"
+                ] = hypic_request_tokens
+                get_forward_context().additional_kwargs[
+                    "hypic_allow_prefix_reuse"
+                ] = not bool(self.num_prompt_logprobs)
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,

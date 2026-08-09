@@ -421,6 +421,11 @@ class CommonAttentionMetadata:
 
     _num_computed_tokens_cache: torch.Tensor | None = None
 
+    # Python request IDs are only consumed by opt-in experimental state
+    # adapters (for example HYPIC).  Keeping this optional avoids adding a
+    # device-side dependency to ordinary attention metadata.
+    request_ids: tuple[str, ...] | None = None
+
     def batch_size(self) -> int:
         return self.seq_lens.shape[0]
 
@@ -438,7 +443,9 @@ class CommonAttentionMetadata:
     If a CPU copy is needed, use `seq_lens.cpu()` instead.
     Will be removed in a future release, please migrate as soon as possible.
     """
+
     )
+
     def seq_lens_cpu(self) -> torch.Tensor:
         if self._seq_lens_cpu is None:
             self._seq_lens_cpu = self.seq_lens.to("cpu")
