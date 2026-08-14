@@ -107,13 +107,26 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
             spec = g.kv_cache_spec
             if isinstance(spec, CrossAttentionSpec):
                 unsupported.append(f"group {g_idx}: CrossAttentionSpec")
-            # Enforce Mamba align mode
-            if isinstance(spec, MambaSpec) and spec.block_size != cache_block_size:
-                unsupported.append(
-                    f"group {g_idx}: MambaSpec with block_size="
-                    f"{spec.block_size} != cache_config.block_size="
-                    f"{cache_block_size} (mamba_cache_mode != 'align')"
-                )
+            if isinstance(spec, MambaSpec):
+                # The store hashes full-attention token blocks while a Mamba
+                # group persists only the latest recurrent-state block. They
+                # can be recovered together only when their block boundaries
+                # are aligned and prefix caching supplies block hashes.
+                if spec.mamba_cache_mode != "align":
+                    unsupported.append(
+                        f"group {g_idx}: MambaSpec with mamba_cache_mode="
+                        f"{spec.mamba_cache_mode!r} (requires 'align')"
+                    )
+                if spec.block_size != cache_block_size:
+                    unsupported.append(
+                        f"group {g_idx}: MambaSpec with block_size="
+                        f"{spec.block_size} != cache_config.block_size="
+                        f"{cache_block_size}"
+                    )
+                if not vllm_config.cache_config.enable_prefix_caching:
+                    unsupported.append(
+                        f"group {g_idx}: MambaSpec without prefix caching"
+                    )
         pcp = vllm_config.parallel_config.prefill_context_parallel_size
         dcp = vllm_config.parallel_config.decode_context_parallel_size
         if len(kv_cache_config.kv_cache_groups) > 1 and pcp * dcp > 1:
@@ -243,7 +256,9 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
     # Worker-side methods
     # ============================================================
 
-    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+    def register_kv_caches(
+        self, kv_caches: dict[str, torch.Tensor | list[torch.Tensor]]
+    ):
         assert self.connector_worker is not None
         self.connector_worker.register_kv_caches(kv_caches)
 

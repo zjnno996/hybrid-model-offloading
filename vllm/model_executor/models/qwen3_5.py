@@ -507,7 +507,11 @@ class Qwen3_5ForCausalLMBase(
         **kwargs: object,
     ):
         hidden_states = self.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds
+            input_ids,
+            positions,
+            intermediate_tensors,
+            inputs_embeds,
+            **kwargs,
         )
 
         return hidden_states
@@ -663,6 +667,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
             positions=positions,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
+            **kwargs,
         )
 
         return hidden_states

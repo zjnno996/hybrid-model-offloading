@@ -280,6 +280,7 @@ class OffloadingConnectorWorker:
                     num_bytes=transfer_result.transfer_size,
                     time=transfer_result.transfer_time,
                     transfer_type=transfer_result.transfer_type,
+                    queue_time=transfer_result.queue_time or 0.0,
                 )
 
             self._connector_worker_meta.mark_completed(job_id)

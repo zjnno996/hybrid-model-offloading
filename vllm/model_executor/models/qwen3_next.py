@@ -60,6 +60,7 @@ from vllm.model_executor.models.qwen2_moe import Qwen2MoeMLP as Qwen3NextMLP
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
+from vllm.v1.kv_offload.hybrid_activation import HybridActivationContext
 
 from .interfaces import (
     EagleModelMixin,
@@ -508,6 +509,7 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        hybrid_activation_context: HybridActivationContext | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -525,11 +527,37 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
         ):
-            hidden_states, residual = layer(
-                positions=positions,
-                hidden_states=hidden_states,
-                residual=residual,
-            )
+            restored = None
+            if hybrid_activation_context is not None:
+                restored = hybrid_activation_context.restore(
+                    layer_idx,
+                    layer.layer_type,
+                    device=hidden_states.device,
+                    dtype=hidden_states.dtype,
+                )
+            if restored is None:
+                hidden_states, residual = layer(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    residual=residual,
+                )
+            else:
+                # This is an optional activation-checkpoint experiment.  A
+                # decoder-layer checkpoint contains the post-MLP hidden
+                # state, so restoring it skips the attention *and* MLP; it is
+                # not a KV-only recovery path and must not be used for the
+                # fair Full-vs-Linear load/recompute comparison.
+                logger.info_once(
+                    "Hybrid activation checkpoint restored layer %d (%s); "
+                    "replay computation skipped for this layer type.",
+                    layer_idx,
+                    layer.layer_type,
+                )
+                hidden_states, residual = restored
+            if hybrid_activation_context is not None:
+                hybrid_activation_context.capture(
+                    layer_idx, layer.layer_type, hidden_states, residual
+                )
             self._maybe_add_hidden_state(
                 aux_hidden_states, layer_idx + 1, hidden_states, residual
             )

@@ -6,6 +6,7 @@ import logging
 import math
 import sys
 import threading
+import time
 import types
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -104,6 +105,30 @@ def _make_store_recving_thread(
     )
     thread.request_queue.task_done = MagicMock()
     return thread
+
+
+def _make_hybrid_coord() -> mooncake_store_worker.MooncakeStoreCoordinator:
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheGroupSpec,
+        MambaSpec,
+    )
+
+    full = FullAttentionSpec(block_size=16, num_kv_heads=8, head_size=64, dtype=None)
+    linear = MambaSpec(
+        block_size=16,
+        shapes=((8, 16), (4, 16, 16)),
+        dtypes=(torch.bfloat16, torch.bfloat16),
+        mamba_cache_mode="align",
+    )
+    return mooncake_store_worker.MooncakeStoreCoordinator(
+        [
+            KVCacheGroupSpec(["full"], full),
+            KVCacheGroupSpec(["linear"], linear),
+        ],
+        scheduler_block_size=16,
+        hash_block_size=16,
+    )
 
 
 def _make_load_req(
@@ -680,6 +705,62 @@ def test_recv_thread_records_partial_failure_metrics(monkeypatch):
     assert stats.data["load_get"][0]["num_bytes"] == 512
     assert stats.data["load_get"][0]["status"] == "partial_failure"
     assert stats.data["load_get"][0]["num_failed_keys"] == 1
+
+
+def test_recv_thread_records_load_queue_wait_metric(monkeypatch):
+    monkeypatch.delenv("VLLM_MOONCAKE_STORE_TIER_LOG", raising=False)
+    store = MagicMock()
+    store.batch_get_into_multi_buffers.return_value = [256]
+    thread = _make_store_recving_thread(store, disk_offload_buffer_budget_bytes=None)
+    stats = MooncakeStoreConnectorStats()
+    thread._record_operation_cb = stats.record_operation
+    req = _make_load_req("req-a", [b"a0"], token_len=16)
+    req.load_enqueue_time = time.perf_counter() - 0.01
+
+    thread._handle_request(req)
+
+    assert len(stats.data["load_queue_wait"]) == 1
+    assert stats.data["load_queue_wait"][0]["num_keys"] == 1
+    assert stats.data["load_queue_wait"][0]["duration_seconds"] >= 0.01
+    assert req.load_enqueue_time is None
+
+
+def test_recv_thread_can_record_full_attention_load_separately(monkeypatch):
+    monkeypatch.setenv("VLLM_MOONCAKE_STORE_SPLIT_HYBRID_LOADS", "1")
+    monkeypatch.delenv("VLLM_MOONCAKE_STORE_TIER_LOG", raising=False)
+    store = MagicMock()
+    store.batch_get_into_multi_buffers.return_value = [256]
+    thread = _make_store_recving_thread(store, disk_offload_buffer_budget_bytes=None)
+    stats = MooncakeStoreConnectorStats()
+    thread._record_operation_cb = stats.record_operation
+
+    thread._handle_request(_make_load_req("req-a", [b"a0"], token_len=16))
+
+    assert len(stats.data["load_get_full_attention"]) == 1
+    assert stats.data["load_get_full_attention"][0]["num_bytes"] == 256
+    assert "load_get" not in stats.data
+
+
+@pytest.mark.parametrize("cls", [
+    mooncake_store_worker.KVCacheStoreRecvingThread,
+    mooncake_store_worker.MooncakeStoreWorker,
+])
+def test_hybrid_policy_selects_expected_groups(monkeypatch, cls):
+    thread_or_worker = object.__new__(cls)
+    thread_or_worker.coord = _make_hybrid_coord()
+
+    for policy in ("full_load_linear_load", "all_load"):
+        monkeypatch.setenv("VLLM_MOONCAKE_HYBRID_POLICY", policy)
+        assert thread_or_worker._group_is_loaded(0)
+        assert thread_or_worker._group_is_loaded(1)
+
+    monkeypatch.setenv("VLLM_MOONCAKE_HYBRID_POLICY", "full_load_linear_replay")
+    assert thread_or_worker._group_is_loaded(0)
+    assert not thread_or_worker._group_is_loaded(1)
+
+    monkeypatch.setenv("VLLM_MOONCAKE_HYBRID_POLICY", "full_replay_linear_load")
+    assert not thread_or_worker._group_is_loaded(0)
+    assert thread_or_worker._group_is_loaded(1)
 
 
 def test_recv_thread_uses_ratio_scaled_budget_for_first_pass_split():

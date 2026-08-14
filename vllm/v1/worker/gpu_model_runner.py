@@ -152,6 +152,13 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.kv_offload.hybrid_activation import (
+    ActivationSegment,
+    HybridActivationContext,
+    LMCacheActivationBackend,
+    HybridActivationStore,
+    activation_key,
+)
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
@@ -459,6 +466,9 @@ class GPUModelRunner(
         # Prevents routed experts code from running during profiling/dummy run.
         self.routed_experts_initialized = False
         self.max_model_len = model_config.max_model_len
+        self.hybrid_activation_store = HybridActivationStore(
+            envs.VLLM_MOONCAKE_HYBRID_ACTIVATION_MAX_BYTES
+        )
 
         # Always set to false after the first forward pass
         self.calculate_kv_scales = self.cache_config.calculate_kv_scales
@@ -3747,6 +3757,108 @@ class GPUModelRunner(
             **model_kwargs,
         )
 
+    def _build_hybrid_activation_context(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> HybridActivationContext | None:
+        """Build the optional activation capture/restore plan.
+
+        This path is intentionally opt-in.  It is only meaningful for the two
+        mixed Qwen3.5 policies; all other models and policies retain the
+        original replay implementation.
+        """
+        if not envs.VLLM_MOONCAKE_HYBRID_ACTIVATION_CHECKPOINT:
+            return None
+        policy = envs.VLLM_MOONCAKE_HYBRID_POLICY
+        if policy not in {"full_load_linear_replay", "full_replay_linear_load"}:
+            return None
+
+        self._maybe_attach_lmcache_activation_backend()
+
+        active_ids = scheduler_output.mooncake_hybrid_replay_active
+        restore_type = (
+            "full_attention"
+            if policy == "full_load_linear_replay"
+            else "linear_attention"
+        )
+        capture_type = None if active_ids else restore_type
+        segments: list[ActivationSegment] = []
+        flat_offset = 0
+        for req_id in self.input_batch.req_ids:
+            token_count = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+            if token_count <= 0:
+                continue
+            request = self.requests[req_id]
+            prompt_length = request.num_prompt_tokens
+            prefix_offset = request.num_computed_tokens
+            key = activation_key(request.prompt_token_ids)
+            if key is None or prefix_offset >= prompt_length:
+                flat_offset += token_count
+                continue
+            self.hybrid_activation_store.register_tokens(
+                key, request.prompt_token_ids
+            )
+            token_count = min(token_count, prompt_length - prefix_offset)
+            segments.append(
+                ActivationSegment(
+                    key=key,
+                    prefix_offset=prefix_offset,
+                    token_count=token_count,
+                    prompt_length=prompt_length,
+                    flat_offset=flat_offset,
+                    active=req_id in active_ids,
+                )
+            )
+            flat_offset += scheduler_output.num_scheduled_tokens.get(req_id, 0)
+
+        if not segments:
+            return None
+        return HybridActivationContext(
+            self.hybrid_activation_store,
+            segments,
+            # A layer can only be skipped when every row in the batch is part
+            # of the same replay prefix.  Keeping the full scheduled-token
+            # count makes mixed prefill/decode batches conservatively fall
+            # back to the normal layer execution.
+            expected_tokens=scheduler_output.total_num_scheduled_tokens,
+            capture_layer_type=capture_type,
+            restore_layer_type=restore_type if active_ids else None,
+        )
+
+    def _maybe_attach_lmcache_activation_backend(self) -> None:
+        """Prefer LMCache's pinned hidden-state pool when it is enabled.
+
+        Native vLLM offloading remains the default and is intentionally kept as
+        the control path.  This hook is lazy because the KV connector is
+        initialized after the model runner is constructed.
+        """
+        if getattr(self.hybrid_activation_store, "_backend", None) is not None:
+            return
+        if not has_kv_transfer_group():
+            return
+        try:
+            connector = get_kv_transfer_group()
+            impl = getattr(connector, "_lmcache_engine", None)
+            engine = getattr(impl, "lmcache_engine", None)
+            if engine is None:
+                engine = impl
+            if getattr(engine, "hidden_state_store", None) is None:
+                return
+            from lmcache.v1.hybrid_recovery import HybridRecoveryStore
+
+            self.hybrid_activation_store.attach_backend(
+                LMCacheActivationBackend(HybridRecoveryStore(engine))
+            )
+            logger.info_once(
+                "Hybrid activation recovery is using LMCache HiddenStateStore "
+                "(separate pinned CPU pool and KV-coupled chunk keys)."
+            )
+        except (ImportError, AttributeError, TypeError, ValueError) as exc:
+            logger.warning_once(
+                "LMCache hidden-state backend unavailable; using native local "
+                "activation checkpoints: %s",
+                exc,
+            )
+
     @staticmethod
     def _is_uniform_decode(
         max_num_scheduled_tokens: int,
@@ -3992,6 +4104,62 @@ class GPUModelRunner(
 
         return slot_mappings_by_gid, slot_mappings_by_layer
 
+    def _protect_loaded_full_kv_slots(
+        self,
+        scheduler_output: "SchedulerOutput",
+        slot_mappings_by_group: dict[int, torch.Tensor] | None,
+    ) -> None:
+        """Keep the loaded hybrid group read-only during the replay pass.
+
+        A mixed replay request may start its replay at token zero because one
+        attention type is absent. The other type's cache may already be
+        restored for the matched prefix. Marking just the restored slots as
+        padding makes the existing cache-update kernels leave them intact;
+        unmatched tail tokens retain normal slot mappings and are
+        computed/written as usual.
+        """
+        policy = envs.VLLM_MOONCAKE_HYBRID_POLICY
+        if slot_mappings_by_group is None or policy not in {
+            "full_load_linear_replay",
+            "full_replay_linear_load",
+        }:
+            return
+        loaded_tokens = scheduler_output.mooncake_hybrid_replay_loaded_tokens
+        if not loaded_tokens:
+            return
+
+        loaded_group_ids = [
+            group_id
+            for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups)
+            if (
+                policy == "full_load_linear_replay"
+                and isinstance(group.kv_cache_spec, FullAttentionSpec)
+            )
+            or (
+                policy == "full_replay_linear_load"
+                and isinstance(group.kv_cache_spec, MambaSpec)
+            )
+        ]
+        if not loaded_group_ids:
+            return
+
+        token_offset = 0
+        for req_id in self.input_batch.req_ids:
+            num_tokens = scheduler_output.num_scheduled_tokens[req_id]
+            request = self.requests[req_id]
+            replay_prefix_remaining = max(
+                0, request.num_prompt_tokens - request.num_computed_tokens
+            )
+            num_loaded = min(
+                loaded_tokens.get(req_id, 0), num_tokens, replay_prefix_remaining
+            )
+            if num_loaded:
+                for group_id in loaded_group_ids:
+                    slot_mappings_by_group[group_id][
+                        token_offset : token_offset + num_loaded
+                    ].fill_(-1)
+            token_offset += num_tokens
+
     def _is_all_reqs_chunked_prefill(self) -> bool:
         """Check if all scheduled requests are marked to discard sampled tokens.
 
@@ -4212,6 +4380,10 @@ class GPUModelRunner(
                 num_tokens_unpadded=num_tokens_unpadded,
                 ubatch_slices=ubatch_slices_padded,
             )
+            self._protect_loaded_full_kv_slots(
+                scheduler_output,
+                slot_mappings_by_group,
+            )
 
             attn_metadata, spec_decode_common_attn_metadata = (
                 self._build_attention_metadata(
@@ -4228,7 +4400,6 @@ class GPUModelRunner(
                     slot_mappings=slot_mappings_by_group,
                 )
             )
-
             (
                 input_ids,
                 inputs_embeds,
@@ -4239,6 +4410,11 @@ class GPUModelRunner(
             ) = self._preprocess(
                 scheduler_output, num_tokens_padded, intermediate_tensors
             )
+            hybrid_activation_context = self._build_hybrid_activation_context(
+                scheduler_output
+            )
+            if hybrid_activation_context is not None:
+                model_kwargs["hybrid_activation_context"] = hybrid_activation_context
 
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible

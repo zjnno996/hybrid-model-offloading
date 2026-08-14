@@ -201,6 +201,17 @@ if TYPE_CHECKING:
     VLLM_NIXL_SIDE_CHANNEL_PORT: int = 5600
     VLLM_MOONCAKE_BOOTSTRAP_PORT: int = 8998
     VLLM_MOONCAKE_STORE_TIER_LOG: bool = False
+    VLLM_MOONCAKE_STORE_SPLIT_HYBRID_LOADS: bool = False
+    VLLM_MOONCAKE_HYBRID_POLICY: str = "all_load"
+    # Experimental CPU activation checkpoints for skipping recovered hybrid
+    # decoder layers during replay.  Disabled by default because checkpoints
+    # consume host memory proportional to prefix length and layer count.
+    VLLM_MOONCAKE_HYBRID_ACTIVATION_CHECKPOINT: bool = False
+    VLLM_MOONCAKE_HYBRID_ACTIVATION_MAX_BYTES: int = 48 * 1024**3
+    # If true, mixed recovery keeps a local prefix hit and replays only the
+    # external suffix.  This requires all groups to have a valid local prefix;
+    # the scheduler falls back to the legacy full replay otherwise.
+    VLLM_MOONCAKE_HYBRID_SUFFIX_ONLY: bool = False
     VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO: float = 0.9
     MOONCAKE_PREFERRED_SEGMENT: str | None = None
     MOONCAKE_REQUESTER_LOCAL_HOSTNAME: str | None = None
@@ -1564,6 +1575,31 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MOONCAKE_STORE_TIER_LOG": lambda: (
         os.getenv("VLLM_MOONCAKE_STORE_TIER_LOG", "False").lower() in ("true", "1")
     ),
+    # Issue Full-Attention and Linear-Attention GETs separately. This retains
+    # correctness but is intended for per-type recovery benchmarking only.
+    "VLLM_MOONCAKE_STORE_SPLIT_HYBRID_LOADS": lambda: (
+        os.getenv("VLLM_MOONCAKE_STORE_SPLIT_HYBRID_LOADS", "False").lower()
+        in ("true", "1")
+    ),
+    # Recovery policy for the experimental hybrid TTFT path.  ``all_load``
+    # preserves the default connector behavior.  The hybrid policies select
+    # the exact KV-cache group types to fetch; ``full_load_linear_replay``
+    # fetches only Full-Attention state and replays the Linear prefix, while
+    # ``full_replay_linear_load`` does the opposite.
+    "VLLM_MOONCAKE_HYBRID_POLICY": lambda: os.getenv(
+        "VLLM_MOONCAKE_HYBRID_POLICY", "all_load"
+    ).lower(),
+    "VLLM_MOONCAKE_HYBRID_ACTIVATION_CHECKPOINT": lambda: os.getenv(
+        "VLLM_MOONCAKE_HYBRID_ACTIVATION_CHECKPOINT", "False"
+    ).lower()
+    in ("true", "1"),
+    "VLLM_MOONCAKE_HYBRID_ACTIVATION_MAX_BYTES": lambda: int(
+        os.getenv("VLLM_MOONCAKE_HYBRID_ACTIVATION_MAX_BYTES", str(48 * 1024**3))
+    ),
+    "VLLM_MOONCAKE_HYBRID_SUFFIX_ONLY": lambda: os.getenv(
+        "VLLM_MOONCAKE_HYBRID_SUFFIX_ONLY", "False"
+    ).lower()
+    in ("true", "1"),
     # Fraction of the owner's DirectIO staging buffer to fill per GET batch.
     "VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO": lambda: float(
         os.getenv("VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO", "0.9")

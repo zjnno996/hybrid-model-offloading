@@ -22,6 +22,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    MambaSpec,
     SlidingWindowSpec,
 )
 from vllm.v1.request import Request
@@ -608,6 +609,60 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             return BlockHashListWithBlockSize(
                 block_hashes, self.hash_block_size, kv_cache_spec.block_size
             )
+
+        # In the suffix-only experiment the two groups intentionally have
+        # different residency: the replay group is already on GPU while the
+        # selected group is restored from CPU.  The normal hybrid coordinator
+        # takes the intersection of all group hits and would therefore turn a
+        # valid Full-prefix hit into zero when the Linear state is absent (or
+        # vice versa).  Use the replay group's independent hit as the local
+        # execution boundary.  The offloading connector then loads the other
+        # group from its own CPU key range.
+        suffix_only = envs.VLLM_MOONCAKE_HYBRID_SUFFIX_ONLY
+        policy = envs.VLLM_MOONCAKE_HYBRID_POLICY
+        if suffix_only and policy in {
+            "full_load_linear_replay",
+            "full_replay_linear_load",
+        }:
+            replay_spec_type = (
+                MambaSpec
+                if policy == "full_load_linear_replay"
+                else FullAttentionSpec
+            )
+            num_groups = len(self.kv_cache_config.kv_cache_groups)
+            replay_blocks: tuple[list[KVCacheBlock], ...] | None = None
+            replay_length = 0
+            for spec, group_ids, manager_cls, use_eagle in self.attention_groups:
+                is_replay_group = isinstance(spec, replay_spec_type)
+                # Only the replay group is needed for the local boundary.  Do
+                # not populate blocks for the remotely restored group: its
+                # allocator must expose a fresh destination for the CPU load.
+                if not is_replay_group:
+                    continue
+                hit_blocks = manager_cls.find_longest_cache_hit(
+                    block_hashes=_get_block_hashes(spec),
+                    max_length=max_cache_hit_length,
+                    kv_cache_group_ids=group_ids,
+                    block_pool=self.block_pool,
+                    kv_cache_spec=spec,
+                    drop_eagle_block=use_eagle,
+                    alignment_tokens=self.scheduler_block_size,
+                )
+                replay_length = len(hit_blocks[0]) * spec.block_size
+                replay_blocks = tuple(hit_blocks)
+                break
+            if replay_blocks is not None:
+                blocks_by_group: list[list[KVCacheBlock]] = [
+                    [] for _ in range(num_groups)
+                ]
+                replay_group = next(
+                    group
+                    for group in self.attention_groups
+                    if isinstance(group.spec, replay_spec_type)
+                )
+                for group_idx, blocks in zip(replay_group.group_ids, replay_blocks):
+                    blocks_by_group[group_idx] = blocks
+                return tuple(blocks_by_group), replay_length
 
         num_groups = len(self.kv_cache_config.kv_cache_groups)
         hit_length = max_cache_hit_length

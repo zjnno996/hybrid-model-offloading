@@ -3,6 +3,9 @@
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+import torch
+
 from vllm.config import set_current_vllm_config
 from vllm.distributed.kv_events import BlockStored
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -27,6 +30,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheTensor,
+    MambaSpec,
 )
 from vllm.v1.outputs import KVConnectorOutput
 
@@ -51,6 +55,31 @@ def _make_kv_cache_config() -> KVCacheConfig:
     )
 
 
+def _make_hybrid_mamba_kv_cache_config(
+    *, mamba_cache_mode: str = "align"
+) -> KVCacheConfig:
+    full = FullAttentionSpec(
+        block_size=16, num_kv_heads=8, head_size=64, dtype=torch.bfloat16
+    )
+    mamba = MambaSpec(
+        block_size=16,
+        shapes=((8, 16), (4, 16, 16)),
+        dtypes=(torch.bfloat16, torch.bfloat16),
+        mamba_cache_mode=mamba_cache_mode,
+    )
+    return KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[
+            KVCacheTensor(size=8192, shared_by=["full"]),
+            KVCacheTensor(size=8192, shared_by=["linear"]),
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["full"], full),
+            KVCacheGroupSpec(["linear"], mamba),
+        ],
+    )
+
+
 def _make_block_stored() -> BlockStored:
     return BlockStored(
         block_hashes=[b"hash"],
@@ -61,6 +90,23 @@ def _make_block_stored() -> BlockStored:
         medium="cpu",
         lora_name=None,
     )
+
+
+def test_hybrid_mamba_store_requires_aligned_prefix_cache_layout():
+    vllm_config = _make_vllm_config()
+    vllm_config.cache_config.enable_prefix_caching = True
+
+    with pytest.raises(ValueError, match="requires 'align'"):
+        mooncake_store_connector.MooncakeStoreConnector._validate_kv_cache_config(
+            vllm_config,
+            _make_hybrid_mamba_kv_cache_config(mamba_cache_mode="none"),
+        )
+
+    vllm_config.cache_config.enable_prefix_caching = False
+    with pytest.raises(ValueError, match="without prefix caching"):
+        mooncake_store_connector.MooncakeStoreConnector._validate_kv_cache_config(
+            vllm_config, _make_hybrid_mamba_kv_cache_config()
+        )
 
 
 def test_scheduler_role_initializes_store_scheduler_only():

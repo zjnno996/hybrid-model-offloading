@@ -32,6 +32,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheTensor,
+    MambaSpec,
     SlidingWindowSpec,
 )
 
@@ -58,6 +59,37 @@ class _DictStore:
 
     def batch_get_into_multi_buffers(self, keys, addrs, sizes, *_args, **_kwargs):
         return [0 if k in self._data else -1 for k in keys]
+
+
+def test_hybrid_full_attention_and_mamba_state_match():
+    """A full prefix hit needs all attention blocks but only Mamba's tail."""
+    full = FullAttentionSpec(
+        block_size=16, num_kv_heads=8, head_size=64, dtype=torch.bfloat16
+    )
+    mamba = MambaSpec(
+        block_size=16,
+        shapes=((8, 16), (4, 16, 16)),
+        dtypes=(torch.bfloat16, torch.bfloat16),
+        mamba_cache_mode="align",
+    )
+    coordinator = MooncakeStoreCoordinator(
+        [KVCacheGroupSpec(["full"], full), KVCacheGroupSpec(["linear"], mamba)],
+        scheduler_block_size=16,
+        hash_block_size=16,
+    )
+    hashes = [BlockHash(bytes([index]) * 32) for index in range(1, 5)]
+    existing = {(0, bytes(block_hash)) for block_hash in hashes}
+    existing.add((1, bytes(hashes[-1])))
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator import (
+        ExternalCachedBlockPool,
+    )
+
+    masks, hit_length = coordinator.find_longest_cache_hit(
+        hashes, 64, ExternalCachedBlockPool(existing)
+    )
+    assert hit_length == 64
+    assert masks == ([True, True, True, True], [False, False, False, True])
 
 
 def _minimal_vllm_config(cache_block_size=16):

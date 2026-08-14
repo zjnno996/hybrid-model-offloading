@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from itertools import islice
 from typing import Any, NamedTuple
 
+import vllm.envs as envs
 from vllm.distributed.kv_events import BlockRemoved, BlockStored, KVCacheEvent
 from vllm.distributed.kv_transfer.kv_connector.utils import yield_req_data
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
@@ -262,6 +263,9 @@ class OffloadingConnectorScheduler:
     def __init__(self, spec: OffloadingSpec):
         self.config = SchedulerOffloadConfig.from_spec(spec)
         self.manager: OffloadingManager = spec.get_manager()
+        self._group_specs = tuple(
+            group.kv_cache_spec for group in spec.kv_cache_config.kv_cache_groups
+        )
 
         full_attention_groups: list[int] = []
         sliding_window_groups: list[int] = []
@@ -282,6 +286,23 @@ class OffloadingConnectorScheduler:
         # used by _lookup
         self._sliding_window_groups: tuple[int, ...] = tuple(sliding_window_groups)
         self._lookup_groups = tuple(full_attention_groups) + self._sliding_window_groups
+
+        # Native CPU offloading normally transfers every KV group.  The
+        # hybrid recovery experiment can select one attention type for P3/P4;
+        # the main Scheduler then performs one replay pass for the missing
+        # attention type.
+        self._loaded_group_indices = self._get_loaded_group_indices()
+        if len(self._loaded_group_indices) != len(self.config.kv_group_configs):
+            selected = set(self._loaded_group_indices)
+            self._lookup_groups = tuple(
+                group_idx for group_idx in self._lookup_groups if group_idx in selected
+            )
+        logger.info(
+            "Native CPU offload hybrid policy=%s; loaded KV groups=%s/%s",
+            envs.VLLM_MOONCAKE_HYBRID_POLICY,
+            self._loaded_group_indices,
+            len(self.config.kv_group_configs),
+        )
 
         self._req_status: dict[ReqId, RequestOffloadState] = {}
         self._current_batch_load_jobs: dict[int, TransferJob] = {}
@@ -307,6 +328,30 @@ class OffloadingConnectorScheduler:
         # protected by their ref_cnt) and for sliding window blocks (which can
         # be freed before a request finishes).
         self._block_id_to_pending_jobs: dict[int, set[int]] = {}
+
+    def _get_loaded_group_indices(self) -> tuple[int, ...]:
+        """Return KV groups materialized from CPU for the active policy."""
+        policy = envs.VLLM_MOONCAKE_HYBRID_POLICY
+        if policy not in {
+            "full_load_linear_replay",
+            "full_replay_linear_load",
+        }:
+            return tuple(range(len(self.config.kv_group_configs)))
+
+        # Qwen3.5 GDN groups use MambaSpec.  Keep this type check explicit so
+        # a future hybrid model does not silently classify an unknown group as
+        # Linear state.
+        if policy == "full_load_linear_replay":
+            return tuple(
+                group_idx
+                for group_idx in range(len(self.config.kv_group_configs))
+                if isinstance(self._group_specs[group_idx], FullAttentionSpec)
+            )
+        return tuple(
+            group_idx
+            for group_idx in range(len(self.config.kv_group_configs))
+            if isinstance(self._group_specs[group_idx], MambaSpec)
+        )
 
     def _generate_job_id(self) -> int:
         job_id = self._job_counter
@@ -366,9 +411,11 @@ class OffloadingConnectorScheduler:
         return consecutive_hits if not defer_lookup else None
 
     def _touch(self, req_status: RequestOffloadState):
-        for group_config, group_state in zip(
-            self.config.kv_group_configs, req_status.group_states
+        for group_idx, (group_config, group_state) in enumerate(
+            zip(self.config.kv_group_configs, req_status.group_states)
         ):
+            if group_idx not in self._loaded_group_indices:
+                continue
             if group_config.sliding_window_size_in_blocks is None:
                 self.manager.touch(group_state.offload_keys, req_status.req_context)
             else:
@@ -395,7 +442,11 @@ class OffloadingConnectorScheduler:
         """
         num_computed_tokens = req_status.num_locally_computed_tokens
         max_hit_size_tokens: int = req_status.req.num_tokens
-        if self._sliding_window_groups:
+        if self._sliding_window_groups and not (
+            envs.VLLM_MOONCAKE_HYBRID_SUFFIX_ONLY
+            and envs.VLLM_MOONCAKE_HYBRID_POLICY
+            in {"full_load_linear_replay", "full_replay_linear_load"}
+        ):
             # the last prompt token has to be recomputed to get the logprobs
             # for sliding window attention, we must reduce by 1 to make sure
             # we still have a hit after reduction
@@ -403,6 +454,11 @@ class OffloadingConnectorScheduler:
         num_hit_tokens: int = 0
         defer_lookup = False
         lookup_groups = self._lookup_groups
+        suffix_only = envs.VLLM_MOONCAKE_HYBRID_SUFFIX_ONLY
+        mixed_policy = envs.VLLM_MOONCAKE_HYBRID_POLICY in {
+            "full_load_linear_replay",
+            "full_replay_linear_load",
+        }
         while lookup_groups:
             looked_up_sliding_window: bool = False
             groups_iter = iter(lookup_groups)
@@ -431,7 +487,16 @@ class OffloadingConnectorScheduler:
                 num_blocks = min(
                     cdiv(max_hit_size_tokens, offloaded_block_size), len(offload_keys)
                 )
-                start_block_idx = num_computed_tokens // offloaded_block_size
+                # The selected group is not represented by the local GPU
+                # prefix in suffix-only mode.  Its CPU object therefore has
+                # to be looked up from token zero (Full KV needs the prefix
+                # keys/values to attend to the suffix; a Linear state is a
+                # whole-prefix recurrent checkpoint).  The returned hit
+                # count remains relative to ``num_computed_tokens`` so the
+                # main scheduler still sees only newly materialized tokens.
+                load_from_zero = suffix_only and mixed_policy
+                lookup_start_tokens = 0 if load_from_zero else num_computed_tokens
+                start_block_idx = lookup_start_tokens // offloaded_block_size
                 offload_keys = offload_keys[start_block_idx:num_blocks]
                 sliding_window_size_in_blocks = (
                     group_config.sliding_window_size_in_blocks
@@ -489,9 +554,11 @@ class OffloadingConnectorScheduler:
 
         # possibly delay request if any of the hit blocks is already being loaded
         if self._blocks_being_loaded:
-            for group_config, group_state in zip(
-                self.config.kv_group_configs, req_status.group_states
+            for group_idx, (group_config, group_state) in enumerate(
+                zip(self.config.kv_group_configs, req_status.group_states)
             ):
+                if group_idx not in self._loaded_group_indices:
+                    continue
                 offloaded_block_size = group_config.offloaded_block_size
                 sliding_window_size_in_blocks = (
                     group_config.sliding_window_size_in_blocks
@@ -500,7 +567,9 @@ class OffloadingConnectorScheduler:
                 num_blocks = cdiv(
                     num_computed_tokens + num_hit_tokens, offloaded_block_size
                 )
-                start_block_idx = num_computed_tokens // offloaded_block_size
+                load_from_zero = suffix_only and mixed_policy
+                lookup_start_tokens = 0 if load_from_zero else num_computed_tokens
+                start_block_idx = lookup_start_tokens // offloaded_block_size
                 offload_keys = offload_keys[start_block_idx:num_blocks]
                 if sliding_window_size_in_blocks is not None:
                     offload_keys = offload_keys[-sliding_window_size_in_blocks:]
@@ -586,14 +655,19 @@ class OffloadingConnectorScheduler:
         # per group
         group_sizes: list[int] = []
         block_indices: list[int] = []
-        for group_config, group_state, group_blocks in zip(
-            self.config.kv_group_configs,
-            req_status.group_states,
-            blocks.blocks,
+        for group_idx, (group_config, group_state, group_blocks) in enumerate(
+            zip(self.config.kv_group_configs, req_status.group_states, blocks.blocks)
         ):
             self._current_batch_allocated_block_ids.update(
                 block.block_id for block in group_blocks if block.block_id != 0
             )
+
+            if group_idx not in self._loaded_group_indices:
+                # Keep the group position in GPULoadStoreSpec, but do not
+                # allocate/load any CPU block for a replay-only group.
+                group_sizes.append(0)
+                block_indices.append(0)
+                continue
 
             gpu_block_size = group_config.gpu_block_size
             offloaded_block_size = group_config.offloaded_block_size
@@ -608,10 +682,26 @@ class OffloadingConnectorScheduler:
                     num_locally_computed_gpu_blocks = i
                     break
 
-            assert (
-                num_locally_computed_tokens
-                <= num_locally_computed_gpu_blocks * gpu_block_size
-            )
+            if num_locally_computed_tokens > (
+                num_locally_computed_gpu_blocks * gpu_block_size
+            ):
+                # Suffix-only hybrid recovery deliberately uses the replay
+                # group's GPU prefix as the scheduler boundary while the
+                # selected group is restored from CPU starting at block zero
+                # (Full KV or a single Linear/Mamba state).  That selected
+                # group has no local prefix blocks by design; its transfer is
+                # still valid and must not be rejected by the ordinary
+                # all-groups-local invariant.
+                suffix_only = envs.VLLM_MOONCAKE_HYBRID_SUFFIX_ONLY
+                mixed_policy = envs.VLLM_MOONCAKE_HYBRID_POLICY in {
+                    "full_load_linear_replay",
+                    "full_replay_linear_load",
+                }
+                if not (suffix_only and mixed_policy):
+                    raise AssertionError(
+                        "locally computed tokens exceed local GPU blocks"
+                    )
+                num_locally_computed_gpu_blocks = 0
             num_pending_gpu_blocks = num_gpu_blocks - num_locally_computed_gpu_blocks
 
             if group_config.sliding_window_size_in_blocks is not None:
@@ -750,9 +840,11 @@ class OffloadingConnectorScheduler:
             # Filter out blocks skipped due to sliding window attention / SSM
             # or unreachable by the load path's alignment constraints.
             new_offload_keys: list[OffloadKey] = []
-            for group_config, group_state in zip(
-                self.config.kv_group_configs, req_status.group_states
+            for group_idx, (group_config, group_state) in enumerate(
+                zip(self.config.kv_group_configs, req_status.group_states)
             ):
+                if group_idx not in self._loaded_group_indices:
+                    continue
                 num_blocks = num_offloadable_tokens // group_config.offloaded_block_size
                 start_block_idx = group_state.next_stored_block_idx
                 if num_blocks <= start_block_idx:
@@ -815,9 +907,13 @@ class OffloadingConnectorScheduler:
             src_block_ids: list[int] = []
             sliding_window_block_ids: list[int] = []
             non_sliding_window_block_ids: list[int] = []
-            for group_config, group_state in zip(
-                self.config.kv_group_configs, req_status.group_states
+            for group_idx, (group_config, group_state) in enumerate(
+                zip(self.config.kv_group_configs, req_status.group_states)
             ):
+                if group_idx not in self._loaded_group_indices:
+                    group_sizes.append(0)
+                    block_indices.append(0)
+                    continue
                 is_sliding_window = (
                     group_config.sliding_window_size_in_blocks is not None
                 )

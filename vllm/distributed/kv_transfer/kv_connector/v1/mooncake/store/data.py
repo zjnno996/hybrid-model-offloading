@@ -211,6 +211,10 @@ class ReqMeta:
     load_spec: LoadSpec | None = None
     is_last_chunk: bool | None = None
     current_event: torch.cuda.Event | None = None
+    # Set by the receiving thread immediately before it enters the asynchronous
+    # load queue. This lets the connector expose queueing separately from the
+    # Mooncake CPU-to-GPU transfer itself.
+    load_enqueue_time: float | None = None
 
     token_ids: list[int] | None = None
 

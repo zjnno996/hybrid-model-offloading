@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -239,6 +239,17 @@ class SchedulerOutput:
     # The worker zeros the corresponding GPU memory before the blocks are used,
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
+
+    # Request -> number of tokens materialized by Mooncake before a one-time
+    # hybrid replay. The worker protects precisely these slots from writes
+    # while it materializes the missing attention group.
+    mooncake_hybrid_replay_loaded_tokens: dict[str, int] = field(
+        default_factory=dict
+    )
+    # Request IDs that are still in the mixed-policy replay pass.  Unlike the
+    # loaded-token map above, this remains populated for every chunked-prefill
+    # step so model layers can consume activation checkpoints.
+    mooncake_hybrid_replay_active: set[str] = field(default_factory=set)
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

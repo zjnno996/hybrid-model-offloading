@@ -29,10 +29,15 @@ _DUMMY_BLOCK_HASH = BlockHash(b"\x00" * 32)
 class ExternalCachedBlockPool:
     """Duck-typed BlockPool backed by a ``(group_id, hash)`` exists set."""
 
-    def __init__(self, exists: set[tuple[int, bytes]] | None = None) -> None:
+    def __init__(
+        self,
+        exists: set[tuple[int, bytes]] | None = None,
+        ignored_group_ids: set[int] | None = None,
+    ) -> None:
         # ``exists=None`` is used on the recv side where hit_length is already
         # determined and we just want each spec's manager to apply its own mask.
         self._exists = exists
+        self._ignored_group_ids = ignored_group_ids or set()
         self.null_block = KVCacheBlock(block_id=0)
         # Dummy ID 1 for present block for duck-typing.
         self._present_block = KVCacheBlock(block_id=1)
@@ -48,6 +53,11 @@ class ExternalCachedBlockPool:
             return [self._present_block] * len(group_ids)
         h = bytes(block_hash)
         if all((g, h) in self._exists for g in group_ids):
+            return [self._present_block] * len(group_ids)
+        # Mixed replay policies intentionally match on only one attention type.
+        # The other type is replayed by the model after the selected group's
+        # transfer completes, so it must not shorten the external hit.
+        if all(g in self._ignored_group_ids for g in group_ids):
             return [self._present_block] * len(group_ids)
         return None
 

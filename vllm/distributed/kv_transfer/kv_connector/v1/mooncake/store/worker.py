@@ -63,7 +63,12 @@ from vllm.v1.core.kv_cache_utils import (
     maybe_convert_block_hash,
     resolve_kv_cache_block_sizes,
 )
-from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    MambaSpec,
+)
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 from .metrics import MooncakeStoreConnectorStats
@@ -741,6 +746,11 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         )
         self.coord = coord
 
+    def add_request(self, request: ReqMeta) -> None:
+        """Queue a load and retain its enqueue time for latency metrics."""
+        request.load_enqueue_time = time.perf_counter()
+        super().add_request(request)
+
     def _add_load_error_block_ids(self, block_ids: list[int]) -> None:
         with self._invalid_block_ids_lock:
             self._invalid_block_ids.update(block_ids)
@@ -751,7 +761,60 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             self._invalid_block_ids.clear()
         return invalid_block_ids
 
+    def _load_operation_for_group(self, group_idx: int) -> str:
+        spec = self.coord.kv_cache_groups[group_idx].kv_cache_spec
+        if isinstance(spec, FullAttentionSpec):
+            return "load_get_full_attention"
+        if isinstance(spec, MambaSpec):
+            return "load_get_linear_attention"
+        return "load_get_other"
+
+    def _hybrid_policy(self) -> str:
+        policy = envs.VLLM_MOONCAKE_HYBRID_POLICY
+        valid = {
+            "all_load",
+            "all_replay",
+            "full_load_linear_load",
+            "full_load_linear_replay",
+            "full_replay_linear_load",
+        }
+        if policy not in valid:
+            raise ValueError(
+                "VLLM_MOONCAKE_HYBRID_POLICY must be one of "
+                f"{sorted(valid)}, got {policy!r}"
+            )
+        return policy
+
+    def _group_is_loaded(self, group_idx: int) -> bool:
+        policy = self._hybrid_policy()
+        if policy in {
+            "all_load",
+            "full_load_linear_load",
+        }:
+            return True
+        if policy == "all_replay":
+            return False
+        operation = self._load_operation_for_group(group_idx)
+        if policy == "full_load_linear_replay":
+            return operation == "load_get_full_attention"
+        return operation == "load_get_linear_attention"
+
+    def _ignored_groups_for_policy(self) -> set[int]:
+        return {
+            idx
+            for idx in range(len(self.coord.kv_cache_groups))
+            if not self._group_is_loaded(idx)
+        }
+
     def _handle_request(self, req_meta: ReqMeta):
+        if req_meta.load_enqueue_time is not None:
+            self._record_operation(
+                "load_queue_wait",
+                req_meta.load_enqueue_time,
+                num_keys=1,
+            )
+            req_meta.load_enqueue_time = None
+
         token_len = req_meta.load_spec.token_len  # type: ignore[union-attr]
         req_id = req_meta.req_id
         mask_num = (
@@ -768,7 +831,10 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         size_list: list[list[int]] = []
         key_list: list[str] = []
         block_id_list: list[int] = []
+        group_idx_list: list[int] = []
         for g_idx, db in enumerate(self.token_databases):
+            if not self._group_is_loaded(g_idx):
+                continue
             mask = load_mask_per_group[g_idx]
             for start, end, key in db.process_tokens(
                 token_len, req_meta.block_hashes, mask_num
@@ -783,6 +849,16 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 addr_list.append(addr)
                 size_list.append(size)
                 block_id_list.append(block_id)
+                group_idx_list.append(g_idx)
+
+        # A type-selective policy can legitimately have no transfer work for
+        # a request (for example, a prefix whose selected group has no
+        # materializable chunk after its per-spec mask).  Treat it as an
+        # already-completed load instead of taking ``tp_rank % 0`` below.
+        if not key_list:
+            self.set_finished_request(req_id)
+            self.request_queue.task_done()
+            return
 
         # Rotate aligned lists by tp_rank for load balancing.
         rotation = self.tp_rank % len(key_list)
@@ -790,8 +866,33 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         addr_list_c = _rotate_list(addr_list, rotation)
         size_list_c = _rotate_list(size_list, rotation)
         block_id_list_c = _rotate_list(block_id_list, rotation)
+        group_idx_list_c = _rotate_list(group_idx_list, rotation)
 
-        load_batches = [(key_list_c, addr_list_c, size_list_c, block_id_list_c)]
+        load_batches = [
+            (key_list_c, addr_list_c, size_list_c, block_id_list_c, "load_get")
+        ]
+        if envs.VLLM_MOONCAKE_STORE_SPLIT_HYBRID_LOADS:
+            load_batches = []
+            for operation in (
+                "load_get_full_attention",
+                "load_get_linear_attention",
+                "load_get_other",
+            ):
+                selected = [
+                    idx
+                    for idx, group_idx in enumerate(group_idx_list_c)
+                    if self._load_operation_for_group(group_idx) == operation
+                ]
+                if selected:
+                    load_batches.append(
+                        (
+                            [key_list_c[idx] for idx in selected],
+                            [addr_list_c[idx] for idx in selected],
+                            [size_list_c[idx] for idx in selected],
+                            [block_id_list_c[idx] for idx in selected],
+                            operation,
+                        )
+                    )
         if self.usable_disk_offload_buffer_budget_bytes is not None:
             total_staging_bytes = sum(
                 _estimate_disk_offload_staging_bytes(size) for size in size_list_c
@@ -833,7 +934,13 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                         block_id_offset:next_block_id_offset
                     ]
                     load_batches.append(
-                        (batch_keys, batch_addrs, batch_sizes, batch_block_ids)
+                        (
+                            batch_keys,
+                            batch_addrs,
+                            batch_sizes,
+                            batch_block_ids,
+                            "load_get",
+                        )
                     )
                     block_id_offset = next_block_id_offset
 
@@ -841,7 +948,13 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         current_batch_block_ids: list[int] = block_id_list_c
         batch_bytes = 0
         try:
-            for batch_keys, batch_addrs, batch_sizes, batch_block_ids in load_batches:
+            for (
+                batch_keys,
+                batch_addrs,
+                batch_sizes,
+                batch_block_ids,
+                operation,
+            ) in load_batches:
                 current_batch_keys = batch_keys
                 current_batch_block_ids = batch_block_ids
                 batch_bytes = _sum_batch_bytes(batch_sizes)
@@ -865,7 +978,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     if value < 0
                 ]
                 self._record_operation(
-                    "load_get",
+                    operation,
                     load_get_start,
                     len(batch_keys),
                     num_bytes=batch_bytes,
@@ -1106,6 +1219,51 @@ class MooncakeStoreWorker:
             )
             for g_idx, g in enumerate(self._kv_cache_groups)
         ]
+
+    def _hybrid_policy(self) -> str:
+        policy = envs.VLLM_MOONCAKE_HYBRID_POLICY
+        valid = {
+            "all_load",
+            "all_replay",
+            "full_load_linear_load",
+            "full_load_linear_replay",
+            "full_replay_linear_load",
+        }
+        if policy not in valid:
+            raise ValueError(
+                "VLLM_MOONCAKE_HYBRID_POLICY must be one of "
+                f"{sorted(valid)}, got {policy!r}"
+            )
+        return policy
+
+    def _load_operation_for_group(self, group_idx: int) -> str:
+        spec = self.coord.kv_cache_groups[group_idx].kv_cache_spec
+        if isinstance(spec, FullAttentionSpec):
+            return "load_get_full_attention"
+        if isinstance(spec, MambaSpec):
+            return "load_get_linear_attention"
+        return "load_get_other"
+
+    def _group_is_loaded(self, group_idx: int) -> bool:
+        policy = self._hybrid_policy()
+        if policy in {
+            "all_load",
+            "full_load_linear_load",
+        }:
+            return True
+        if policy == "all_replay":
+            return False
+        operation = self._load_operation_for_group(group_idx)
+        if policy == "full_load_linear_replay":
+            return operation == "load_get_full_attention"
+        return operation == "load_get_linear_attention"
+
+    def _ignored_groups_for_policy(self) -> set[int]:
+        return {
+            idx
+            for idx in range(len(self.coord.kv_cache_groups))
+            if not self._group_is_loaded(idx)
+        }
 
     def register_cross_layers_kv_caches(self, kv_cache: torch.Tensor) -> None:
         """Register a cross-layers KV cache tensor.
@@ -1373,6 +1531,8 @@ class MooncakeStoreWorker:
         candidate_meta: list[tuple[int, bytes]] = []
         tp_count = min(self.tp_size, self.num_kv_head)
         for g_idx, db in enumerate(self.token_dbs):
+            if not self._group_is_loaded(g_idx):
+                continue
             spec_block_size = db.block_size
             group_hashes = self.coord.block_hashes_for_spec(
                 block_hashes, self._kv_cache_groups[g_idx].kv_cache_spec
@@ -1418,7 +1578,11 @@ class MooncakeStoreWorker:
         exists_set = {gh for gh, c in present_count.items() if c >= expected_per_key}
 
         _masks, hit_length = self.coord.find_longest_cache_hit(
-            block_hashes, token_len, ExternalCachedBlockPool(exists_set)
+            block_hashes,
+            token_len,
+            ExternalCachedBlockPool(
+                exists_set, ignored_group_ids=self._ignored_groups_for_policy()
+            ),
         )
         return hit_length
 

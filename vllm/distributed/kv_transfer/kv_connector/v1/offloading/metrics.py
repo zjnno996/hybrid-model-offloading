@@ -20,6 +20,7 @@ logger = init_logger(__name__)
 class OffloadingOperationMetrics:
     op_size: int
     op_time: float
+    queue_time: float = 0.0
 
 
 @dataclass
@@ -55,21 +56,30 @@ class OffloadingConnectorStats(KVConnectorStats):
             assert isinstance(ops_list, list)
             total_bytes = 0
             total_time = 0.0
+            total_queue_time = 0.0
             for op in ops_list:
                 assert isinstance(op, dict)
                 total_bytes += op["op_size"]
                 total_time += op["op_time"]
+                total_queue_time += op.get("queue_time", 0.0)
             return_dict[f"{transfer_type}_total_bytes"] = total_bytes
             return_dict[f"{transfer_type}_total_time"] = total_time
+            return_dict[f"{transfer_type}_total_queue_time"] = total_queue_time
         return return_dict
 
     def is_empty(self) -> bool:
         return not self.data
 
-    def record_transfer(self, num_bytes: int, time: float, transfer_type: TransferType):
+    def record_transfer(
+        self,
+        num_bytes: int,
+        time: float,
+        transfer_type: TransferType,
+        queue_time: float = 0.0,
+    ):
         src, dst = transfer_type
         transfer_type_key = src + "_to_" + dst
-        op = OffloadingOperationMetrics(num_bytes, time)
+        op = OffloadingOperationMetrics(num_bytes, time, queue_time)
         if transfer_type_key in self.data:
             self.data[transfer_type_key].append(op)
         else:

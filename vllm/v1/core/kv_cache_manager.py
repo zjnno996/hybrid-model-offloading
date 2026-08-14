@@ -445,6 +445,29 @@ class KVCacheManager:
         """
         self.coordinator.free(request.request_id)
 
+    def reset_external_cache_for_replay(self, request: Request) -> None:
+        """Prepare a received prefix for the mixed-policy replay pass.
+
+        The async load path allocates request blocks for *every* KV group so
+        that the connector can complete the transfer.  Mixed policies then
+        replay the prompt to materialize the group that was not transferred.
+        Those blocks must stay attached to the request: the selected group
+        contains valid read-only data and the replayed group contains the
+        scratch allocation that the prefill will overwrite.
+
+        Keep ``num_cached_block`` in sync with the attached blocks.  Clearing
+        the marker while retaining ``req_to_blocks`` makes the next scheduler
+        step enter the new-request prefix-hit path, which asserts that the
+        request has no blocks and crashes under concurrent mixed recovery.
+        The replay scheduler already disables prefix-cache lookup, so retaining
+        this marker does not skip the replay computation or issue another load.
+        """
+        managers = getattr(self.coordinator, "single_type_managers", ())
+        for manager in managers:
+            blocks = manager.req_to_blocks.get(request.request_id)
+            if blocks:
+                manager.num_cached_block[request.request_id] = len(blocks)
+
     def remove_skipped_blocks(
         self, request_id: str, total_computed_tokens: int
     ) -> None:

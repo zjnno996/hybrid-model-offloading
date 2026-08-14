@@ -148,6 +148,22 @@ class Request:
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0
         self.cache_salt: str | None = cache_salt
+        # Experimental Mooncake hybrid recovery: after a selected attention
+        # group is loaded for a mixed replay policy, the prompt is replayed
+        # once so the other group can materialize its state. This flag prevents
+        # the replay pass from issuing the same external lookup a second time.
+        self.hybrid_replay_pending = False
+        self.hybrid_loaded_tokens = 0
+        self.hybrid_loaded_tokens_total = 0
+        # Number of locally materialized prefix tokens retained when the
+        # suffix-only mixed-recovery experiment is enabled.  A zero value
+        # means the request must use the legacy full replay path.
+        self.hybrid_local_tokens = 0
+        self.hybrid_suffix_only = False
+        # Remains true while the mixed-policy prompt is replayed.  The
+        # activation-checkpoint path uses this to skip recovered layer types
+        # across chunked prefill steps.
+        self.hybrid_replay_active = False
 
         # Multi-modal related
         self.mm_features = mm_features or []

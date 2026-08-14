@@ -21,6 +21,9 @@ class TransferResult:
     transfer_size: int | None = None  # Size in bytes
     transfer_time: float | None = None
     transfer_type: TransferType | None = None
+    # Time spent waiting behind an earlier transfer on the same copy stream.
+    # This is distinct from transfer_time (the CUDA copy service time).
+    queue_time: float | None = None
 
 
 class OffloadingHandler(ABC):

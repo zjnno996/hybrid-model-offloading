@@ -9,6 +9,7 @@ from typing import Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
+import vllm.envs as envs
 from vllm.distributed.ec_transfer.ec_connector.base import (
     ECConnectorMetadata,
     ECConnectorRole,
@@ -60,6 +61,10 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+def _is_mooncake_hybrid_replay_policy(policy: str) -> bool:
+    return policy in {"full_load_linear_replay", "full_replay_linear_load"}
 
 
 class Scheduler(SchedulerInterface):
@@ -357,6 +362,8 @@ class Scheduler(SchedulerInterface):
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
+        mooncake_hybrid_replay_loaded_tokens: dict[str, int] = {}
+        mooncake_hybrid_replay_active: set[str] = set()
         token_budget = self.max_num_scheduled_tokens
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
@@ -603,17 +610,50 @@ class Scheduler(SchedulerInterface):
 
                 num_external_computed_tokens = 0
                 load_kv_async = False
+                hybrid_replay = False
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
 
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
+                    hybrid_replay = request.hybrid_replay_pending
+                    mixed_policy = _is_mooncake_hybrid_replay_policy(
+                        envs.VLLM_MOONCAKE_HYBRID_POLICY
+                    )
+                    # The legacy mixed path deliberately ignores local
+                    # prefix-cache hits because it replays the whole prompt.
+                    # Suffix-only recovery must retain the local prefix: the
+                    # missing group is loaded only for the suffix and the
+                    # already-computed prefix supplies the recurrent state.
+                    suffix_only_policy = (
+                        mixed_policy and envs.VLLM_MOONCAKE_HYBRID_SUFFIX_ONLY
+                    )
+                    skip_local_cache = hybrid_replay or (
+                        mixed_policy and not suffix_only_policy
+                    )
+                    original_skip_reading_prefix_cache = (
+                        request.skip_reading_prefix_cache
+                    )
+                    if skip_local_cache:
+                        # The selected group's blocks are resident in the
+                        # request allocation, but mixed policies deliberately
+                        # use only the external selected-group lookup.
+                        request.skip_reading_prefix_cache = True
                     # Get locally-cached tokens.
                     new_computed_blocks, num_new_local_computed_tokens = (
                         self.kv_cache_manager.get_computed_blocks(request)
                     )
+                    if skip_local_cache:
+                        request.skip_reading_prefix_cache = (
+                            original_skip_reading_prefix_cache
+                        )
 
                     # Get externally-cached tokens if using a KVConnector.
-                    if self.connector is not None:
+                    # A mixed Mooncake policy has already transferred one
+                    # attention group and now needs one real prompt replay for
+                    # the other group.  Do not look up/load the same prefix
+                    # again on that replay pass.
+                    request.hybrid_replay_pending = False
+                    if self.connector is not None and not hybrid_replay:
                         ext_tokens, load_kv_async = (
                             self.connector.get_num_new_matched_tokens(
                                 request, num_new_local_computed_tokens
@@ -820,6 +860,28 @@ class Scheduler(SchedulerInterface):
                     # _update_waiting_for_remote_kv will then cache
                     # only the successfully loaded tokens.
                     request.num_computed_tokens = num_computed_tokens
+                    if (
+                        envs.VLLM_MOONCAKE_HYBRID_SUFFIX_ONLY
+                        and _is_mooncake_hybrid_replay_policy(
+                            envs.VLLM_MOONCAKE_HYBRID_POLICY
+                        )
+                        and num_new_local_computed_tokens > 0
+                    ):
+                        # Keep the local prefix as the starting point for the
+                        # post-load replay.  If there was no local hit, the
+                        # unselected group has no valid prefix state and the
+                        # request falls back to legacy full replay.
+                        request.hybrid_local_tokens = (
+                            num_new_local_computed_tokens
+                        )
+                        request.hybrid_suffix_only = True
+                        logger.info(
+                            "Hybrid suffix-only armed request=%s local_prefix=%d "
+                            "external_tokens=%d",
+                            request.request_id,
+                            num_new_local_computed_tokens,
+                            num_external_computed_tokens,
+                        )
                     self._inflight_prefills.add(request)
                     continue
 
@@ -841,6 +903,13 @@ class Scheduler(SchedulerInterface):
                     request_id
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
+                if request.hybrid_replay_active or hybrid_replay:
+                    mooncake_hybrid_replay_active.add(request_id)
+                    mooncake_hybrid_replay_loaded_tokens[request_id] = (
+                        request.hybrid_loaded_tokens_total
+                    )
+                if hybrid_replay:
+                    request.hybrid_loaded_tokens = 0
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
@@ -945,6 +1014,10 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
+            mooncake_hybrid_replay_loaded_tokens=(
+                mooncake_hybrid_replay_loaded_tokens
+            ),
+            mooncake_hybrid_replay_active=mooncake_hybrid_replay_active,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -2174,14 +2247,62 @@ class Scheduler(SchedulerInterface):
 
             self.failed_recving_kv_req_ids.remove(request.request_id)
         else:
-            # Now that the blocks are ready, actually cache them.
-            # This will cache the blocks iff caching is enabled.
-            self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)
+            mixed_policy = _is_mooncake_hybrid_replay_policy(
+                envs.VLLM_MOONCAKE_HYBRID_POLICY
+            )
+            if mixed_policy:
+                # The next scheduler step performs a genuine prompt prefill,
+                # materializing the replayed attention group.  The selected
+                # group's transfer has already been paid for in TTFT.
+                #
+                # Keep the selected group's transferred blocks attached to the
+                # request.  The following replay pass must be able to use that
+                # group as a read-only cache; releasing it here turns a mixed
+                # recovery into transfer followed by an unrelated full replay.
+                # ``reset_external_cache_for_replay`` keeps the allocated
+                # blocks and synchronizes their cached-block bookkeeping.  The
+                # replay pass disables prefix-cache lookup, so those blocks
+                # remain available as read-only/scratch storage without being
+                # mistaken for a new request's prefix hit.
+                request.hybrid_loaded_tokens = request.num_computed_tokens
+                request.hybrid_loaded_tokens_total = request.num_computed_tokens
+                if request.hybrid_suffix_only:
+                    # The external transfer covers the missing suffix while
+                    # the local prefix remains valid for every KV group.  Do
+                    # not reset the request to token zero: the next forward
+                    # should schedule only the suffix and use its recurrent
+                    # state at the local-prefix boundary.
+                    request.hybrid_loaded_tokens_total = max(
+                        0,
+                        request.num_computed_tokens - request.hybrid_local_tokens,
+                    )
+                    request.num_computed_tokens = request.hybrid_local_tokens
+                    request.hybrid_replay_pending = False
+                    logger.info(
+                        "Hybrid suffix-only replay request=%s local_prefix=%d "
+                        "loaded_tokens=%d",
+                        request.request_id,
+                        request.hybrid_local_tokens,
+                        request.hybrid_loaded_tokens_total,
+                    )
+                else:
+                    # Legacy mixed recovery: no usable local prefix was found,
+                    # so replay the complete prompt from token zero.
+                    request.num_computed_tokens = 0
+                    request.hybrid_replay_pending = True
+                request.hybrid_replay_active = True
+                self.kv_cache_manager.reset_external_cache_for_replay(request)
+            else:
+                # Now that the blocks are ready, actually cache them.
+                # This will cache the blocks iff caching is enabled.
+                self.kv_cache_manager.cache_blocks(
+                    request, request.num_computed_tokens
+                )
 
-            # on a full prompt hit, we need to re-compute the last token
-            # in order to be able to sample the next token
-            if request.num_computed_tokens == request.num_tokens:
-                request.num_computed_tokens = request.num_tokens - 1
+                # On a full prompt hit, we need to re-compute the last token
+                # in order to be able to sample the next token.
+                if request.num_computed_tokens == request.num_tokens:
+                    request.num_computed_tokens = request.num_tokens - 1
 
         self.finished_recving_kv_req_ids.remove(request.request_id)
 

@@ -71,6 +71,7 @@ class Transfer:
     batch_src: torch.Tensor
     batch_dst: torch.Tensor
     batch_sizes: torch.Tensor
+    previous_end_event: torch.Event | None = None
 
 
 def compute_sub_block_ptrs(
@@ -419,6 +420,9 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
                 batch_src=batch_src,
                 batch_dst=batch_dst,
                 batch_sizes=batch_sizes,
+                previous_end_event=(
+                    self._transfers[-1].end_event if self._transfers else None
+                ),
             )
         )
 
@@ -433,12 +437,19 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
             transfer_time = (
                 transfer.start_event.elapsed_time(transfer.end_event) * 1e-3
             )  # elapsed_time is in milliseconds
+            queue_time = 0.0
+            if transfer.previous_end_event is not None:
+                queue_time = (
+                    transfer.previous_end_event.elapsed_time(transfer.start_event)
+                    * 1e-3
+                )
             result = TransferResult(
                 job_id=transfer.job_id,
                 success=True,
                 transfer_size=transfer.num_bytes,
                 transfer_time=transfer_time,
                 transfer_type=self.transfer_type,
+                queue_time=queue_time,
             )
 
             results.append(result)

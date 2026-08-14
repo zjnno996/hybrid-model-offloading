@@ -9,7 +9,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_connector import (
     LMCacheConnectorV1,
     LMCacheKVEvents,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.base import supports_hma
 from vllm.v1.outputs import KVConnectorOutput
+
+
+def test_lmcache_connector_supports_hma():
+    """LMCache must not disable HMA for hybrid Qwen-style KV groups."""
+    assert supports_hma(LMCacheConnectorV1)
 
 
 @pytest.fixture
